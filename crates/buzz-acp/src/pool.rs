@@ -87,6 +87,11 @@ pub struct SessionState {
     /// channel_id → session_id
     pub sessions: HashMap<Uuid, String>,
     pub heartbeat_session: Option<String>,
+    /// Single shared session reused across all channels and the heartbeat.
+    /// Used only when `single_session` is enabled (adapters that host one
+    /// session per connection, e.g. prime-agent). When set, `sessions` and
+    /// `heartbeat_session` are ignored for session selection.
+    pub shared_session: Option<String>,
     /// Per-channel turn counters for proactive session rotation.
     /// Incremented on each successful prompt; reset when the session is rotated.
     pub turn_counts: HashMap<Uuid, u32>,
@@ -107,6 +112,9 @@ pub struct SessionState {
 impl SessionState {
     /// Invalidate the session (and turn counter) for a specific prompt source.
     pub fn invalidate(&mut self, source: &PromptSource) {
+        // In single-session mode there is exactly one shared session, so any
+        // source invalidation drops it (the next turn recreates it fresh).
+        self.shared_session = None;
         match source {
             PromptSource::Channel(cid) => {
                 self.invalidate_channel(cid);
@@ -121,6 +129,9 @@ impl SessionState {
     /// Invalidate a single channel's session and turn counter.
     /// Returns `true` if the channel had an active session.
     pub fn invalidate_channel(&mut self, channel_id: &Uuid) -> bool {
+        // In single-session mode the shared session is channel-agnostic; any
+        // per-channel invalidation drops it so the next turn recreates fresh.
+        self.shared_session = None;
         self.turn_counts.remove(channel_id);
         self.core_sections.remove(channel_id);
         self.canvas_sections.remove(channel_id);
@@ -133,6 +144,7 @@ impl SessionState {
         self.turn_counts.clear();
         self.heartbeat_session = None;
         self.heartbeat_turn_count = 0;
+        self.shared_session = None;
         self.core_sections.clear();
         self.canvas_sections.clear();
     }
@@ -550,6 +562,11 @@ pub struct PromptContext {
     /// the desktop keys per (agent, relay) pair, e.g. `session_config_captured`,
     /// mirroring the `managed_agent_runtime_lifecycle` frames.
     pub relay_url: String,
+    /// Reuse a single ACP session across all channels and the heartbeat instead
+    /// of one session per channel. Required for adapters that host only one
+    /// session per connection (e.g. prime-agent). Context rides via the embedded
+    /// prompt, not per-session state.
+    pub single_session: bool,
 }
 
 impl AgentPool {
@@ -1538,7 +1555,73 @@ pub async fn run_prompt_task(
         PromptSource::Heartbeat => None,
     };
 
-    let (session_id, is_new_session) = match &source {
+    let (session_id, is_new_session) = if ctx.single_session {
+        // single-session mode: one shared ACP session across all channels and the
+        // heartbeat. Required for adapters that host only one session per connection
+        // (e.g. prime-agent — a second `session/new` on the same connection returns
+        // -32603). Per-turn context rides via the embedded prompt, so a single
+        // session is safe. The title is channel-qualified only on first creation.
+        if let Some(sid) = &agent.state.shared_session {
+            (sid.clone(), false)
+        } else {
+            let title_channel = match &source {
+                PromptSource::Channel(cid) => {
+                    resolve_new_session_channel_context(&ctx.channel_info, *cid)
+                        .await
+                        .1
+                }
+                PromptSource::Heartbeat => None,
+            };
+            match create_session_and_apply_model(
+                &mut agent,
+                &ctx,
+                agent_core.as_deref(),
+                agent_canvas.as_deref(),
+                title_channel.as_deref(),
+            )
+            .await
+            {
+                Ok(sid) => {
+                    tracing::info!(
+                        target: "pool::session",
+                        "created shared single session {sid} for agent {} (source {:?})",
+                        agent.index,
+                        source
+                    );
+                    agent.state.shared_session = Some(sid.clone());
+                    // Commit canvas only after session creation succeeds (I3).
+                    if let Some((pending_cid, section)) = pending_canvas.take() {
+                        agent.state.canvas_sections.insert(pending_cid, section);
+                    }
+                    (sid, true)
+                }
+                Err(AcpError::AgentExited) => {
+                    agent.state.invalidate_all();
+                    send_prompt_result(
+                        &result_tx,
+                        &turn_id,
+                        agent,
+                        source,
+                        PromptOutcome::AgentExited,
+                        requeue_batch_if_queue(&ctx, batch),
+                    );
+                    return;
+                }
+                Err(e) => {
+                    send_prompt_result(
+                        &result_tx,
+                        &turn_id,
+                        agent,
+                        source,
+                        PromptOutcome::Error(e),
+                        requeue_batch_if_queue(&ctx, batch),
+                    );
+                    return;
+                }
+            }
+        }
+    } else {
+        match &source {
         PromptSource::Channel(cid) => {
             if let Some(sid) = agent.state.sessions.get(cid) {
                 (sid.clone(), false)
@@ -1635,6 +1718,7 @@ pub async fn run_prompt_task(
                     }
                 }
             }
+        }
         }
     };
     agent.acp.set_observer_context(observer::context_for_turn(
@@ -4446,6 +4530,39 @@ mod tests {
     }
 
     #[test]
+    fn test_invalidate_clears_shared_session() {
+        let (mut s, ch_a, _ch_b) = make_state();
+        s.shared_session = Some("sess-shared".into());
+        // Any source invalidation drops the shared session (single-session mode).
+        s.invalidate(&PromptSource::Channel(ch_a));
+        assert!(s.shared_session.is_none());
+    }
+
+    #[test]
+    fn test_invalidate_heartbeat_clears_shared_session() {
+        let (mut s, _ch_a, _ch_b) = make_state();
+        s.shared_session = Some("sess-shared".into());
+        s.invalidate(&PromptSource::Heartbeat);
+        assert!(s.shared_session.is_none());
+    }
+
+    #[test]
+    fn test_invalidate_channel_clears_shared_session() {
+        let (mut s, ch_a, _ch_b) = make_state();
+        s.shared_session = Some("sess-shared".into());
+        s.invalidate_channel(&ch_a);
+        assert!(s.shared_session.is_none());
+    }
+
+    #[test]
+    fn test_invalidate_all_clears_shared_session() {
+        let (mut s, _ch_a, _ch_b) = make_state();
+        s.shared_session = Some("sess-shared".into());
+        s.invalidate_all();
+        assert!(s.shared_session.is_none());
+    }
+
+    #[test]
     fn test_invalidate_channel_returns_true_when_session_existed() {
         let (mut s, ch_a, ch_b) = make_state();
         assert!(s.invalidate_channel(&ch_a));
@@ -5388,6 +5505,7 @@ mod tests {
             memory_enabled: false,
             harness_name: "goose".to_string(),
             relay_url: "ws://127.0.0.1:3000".to_string(),
+            single_session: false,
         }
     }
 

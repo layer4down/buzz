@@ -1559,6 +1559,7 @@ async fn tokio_main() -> Result<()> {
         memory_enabled: config.memory_enabled,
         harness_name: crate::config::normalize_agent_command_identity(&config.agent_command),
         relay_url: config.relay_url.clone(),
+        single_session: config.single_session,
     });
 
     if !config.memory_enabled {
@@ -5016,6 +5017,7 @@ mod build_mcp_servers_tests {
             has_generated_codex_config: false,
             relay_observer: false,
             lazy_pool: false,
+            single_session: false,
             agent_owner: None,
             no_base_prompt: false,
             base_prompt_content: None,
@@ -5237,6 +5239,7 @@ mod error_outcome_emission_tests {
             has_generated_codex_config: false,
             relay_observer: false,
             lazy_pool: false,
+            single_session: false,
             agent_owner: None,
             no_base_prompt: false,
             base_prompt_content: None,

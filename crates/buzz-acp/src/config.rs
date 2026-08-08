@@ -477,6 +477,14 @@ pub struct CliArgs {
     /// Connect and subscribe before starting the ACP/LLM subprocess pool.
     #[arg(long, env = "BUZZ_ACP_LAZY_POOL", default_value_t = false)]
     pub lazy_pool: bool,
+
+    /// Reuse a single ACP session across all channels and the heartbeat instead
+    /// of creating one session per channel. Required for adapters that host only
+    /// one session per connection (e.g. prime-agent: a second `session/new` on
+    /// the same connection returns -32603). Context for each turn rides via the
+    /// embedded prompt, not per-session state.
+    #[arg(long, env = "BUZZ_ACP_SINGLE_SESSION", default_value_t = false)]
+    pub single_session: bool,
 }
 
 /// Merged NIP-01 subscription filter for a single channel.
@@ -552,6 +560,11 @@ pub struct Config {
     pub relay_observer: bool,
     /// Whether ACP/LLM subprocess initialization is deferred until accepted work arrives.
     pub lazy_pool: bool,
+    /// Reuse a single ACP session across all channels and the heartbeat instead
+    /// of one session per channel. Required for adapters that host only one
+    /// session per connection (e.g. prime-agent). Context rides via the embedded
+    /// prompt, not per-session state.
+    pub single_session: bool,
     /// Agent owner pubkey (hex). Used for `--respond-to=owner-only` gate.
     /// Replaces the old REST-based owner lookup.
     pub agent_owner: Option<String>,
@@ -1099,6 +1112,7 @@ impl Config {
             has_generated_codex_config,
             relay_observer: args.relay_observer,
             lazy_pool: args.lazy_pool,
+            single_session: args.single_session,
             agent_owner: args.agent_owner.map(|s| s.trim().to_ascii_lowercase()),
             no_base_prompt: args.no_base_prompt,
             base_prompt_content,
@@ -1123,7 +1137,7 @@ impl Config {
             format!(" allowed_respond_to=[{}]", modes.join(","))
         };
         format!(
-            "relay={} pubkey={} agent_cmd={} {} mcp_cmd={} idle_timeout={}s max_turn={}s agents={} heartbeat={}s subscribe={:?} dedup={:?} meh={:?} ignore_self={} context_limit={} max_turns_per_session={} presence={} typing={} memory={} model={} permission_mode={} {}{}",
+            "relay={} pubkey={} agent_cmd={} {} mcp_cmd={} idle_timeout={}s max_turn={}s agents={} heartbeat={}s subscribe={:?} dedup={:?} meh={:?} ignore_self={} context_limit={} max_turns_per_session={} presence={} typing={} memory={} model={} permission_mode={} single_session={} {}{}",
             self.relay_url,
             self.keys.public_key().to_hex(),
             self.agent_command,
@@ -1144,6 +1158,7 @@ impl Config {
             self.memory_enabled,
             self.model.as_deref().unwrap_or("(agent default)"),
             self.permission_mode,
+            self.single_session,
             respond_to_detail,
             allowed_respond_to_detail,
         )
@@ -1469,6 +1484,7 @@ mod tests {
             has_generated_codex_config: false,
             relay_observer: false,
             lazy_pool: false,
+            single_session: false,
             agent_owner: None,
             no_base_prompt: false,
             base_prompt_content: None,
