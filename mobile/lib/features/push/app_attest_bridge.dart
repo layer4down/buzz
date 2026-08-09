@@ -5,31 +5,32 @@ import 'package:flutter/services.dart';
 /// Bridge to the native iOS App Attest framework.
 ///
 /// App Attest proves to the push gateway that the device is a genuine Apple
-/// device running a legitimate app instance. The native side (BuzzPushKit)
-/// wraps `DCAppAttestService`:
+/// device running a legitimate app instance. The native side wraps
+/// `DCAppAttestService`.
 ///
-/// - [attest] generates a new App Attest key, requests an attestation object
-///   from Apple, and returns the CBOR attestation + key ID.
-/// - [assertion] signs a client-data hash with an existing key, proving
-///   possession for mutations (delegate, rotate, revoke).
+/// Key generation is separated from attestation because the enroll transcript
+/// includes the key ID — the orchestrator must generate the key first, then
+/// build the transcript with the real key ID, then hash and attest.
 ///
 /// On non-iOS platforms, all calls throw [UnsupportedError].
 abstract class AppAttestBridge {
-  /// Generate (or reuse) an App Attest key, obtain an attestation from Apple,
-  /// and return the base64-encoded CBOR attestation object.
-  ///
-  /// [challenge] is the gateway-issued challenge string that gets embedded in
-  /// the attestation client data.
-  ///
-  /// Returns a record of (keyId, attestationBase64).
-  Future<({String keyId, String attestation})> attest(String challenge);
+  /// Generate a new App Attest key pair. Returns the key ID (hex string).
+  Future<String> generateKey();
 
-  /// Produce a base64-encoded assertion signature over [clientDataHash].
+  /// Obtain an attestation from Apple for [keyId].
   ///
-  /// [keyId] must be a key previously created via [attest].
-  /// [clientDataHash] is the SHA-256 hash of the canonical transcript string
-  /// (domain separator + JSON body), hex-encoded.
-  Future<String> assertion({
+  /// [clientDataHash] is the hex-encoded SHA-256 hash of the canonical
+  /// transcript string. Returns the base64-encoded CBOR attestation object.
+  Future<String> attestKey({
+    required String keyId,
+    required String clientDataHash,
+  });
+
+  /// Generate an assertion signature over [clientDataHash] with [keyId].
+  ///
+  /// Used for mutations: delegate, rotate endpoint, revoke.
+  /// Returns the base64-encoded assertion object.
+  Future<String> generateAssertion({
     required String keyId,
     required String clientDataHash,
   });
@@ -38,38 +39,30 @@ abstract class AppAttestBridge {
 /// Production implementation using a platform method channel.
 ///
 /// The native side (Swift) must register handlers for:
-/// - `attest(challenge: String)` → `{key_id, attestation}`
-/// - `assert(key_id, client_data_hash)` → `{assertion}`
+/// - `generate_key()` → `{key_id}`
+/// - `attest_key(key_id, client_data_hash)` → `{attestation}`
+/// - `generate_assertion(key_id, client_data_hash)` → `{assertion}`
 class MethodChannelAppAttestBridge implements AppAttestBridge {
   static const _channel = MethodChannel('com.block.buzz/app_attest');
 
   @override
-  Future<({String keyId, String attestation})> attest(
-    String challenge,
-  ) async {
+  Future<String> generateKey() async {
     if (!Platform.isIOS) {
       throw UnsupportedError('App Attest is only available on iOS');
     }
 
-    final result = await _channel.invokeMapMethod<String, dynamic>('attest', {
-      'challenge': challenge,
-    });
-
+    final result = await _channel.invokeMapMethod<String, dynamic>('generate_key');
     if (result == null) {
       throw PlatformException(
         code: 'app_attest_failed',
-        message: 'Native attest returned null',
+        message: 'Native generate_key returned null',
       );
     }
-
-    return (
-      keyId: result['key_id'] as String,
-      attestation: result['attestation'] as String,
-    );
+    return result['key_id'] as String;
   }
 
   @override
-  Future<String> assertion({
+  Future<String> attestKey({
     required String keyId,
     required String clientDataHash,
   }) async {
@@ -77,7 +70,7 @@ class MethodChannelAppAttestBridge implements AppAttestBridge {
       throw UnsupportedError('App Attest is only available on iOS');
     }
 
-    final result = await _channel.invokeMapMethod<String, dynamic>('assert', {
+    final result = await _channel.invokeMapMethod<String, dynamic>('attest_key', {
       'key_id': keyId,
       'client_data_hash': clientDataHash,
     });
@@ -85,10 +78,32 @@ class MethodChannelAppAttestBridge implements AppAttestBridge {
     if (result == null) {
       throw PlatformException(
         code: 'app_attest_failed',
-        message: 'Native assert returned null',
+        message: 'Native attest_key returned null',
       );
     }
+    return result['attestation'] as String;
+  }
 
+  @override
+  Future<String> generateAssertion({
+    required String keyId,
+    required String clientDataHash,
+  }) async {
+    if (!Platform.isIOS) {
+      throw UnsupportedError('App Attest is only available on iOS');
+    }
+
+    final result = await _channel.invokeMapMethod<String, dynamic>('generate_assertion', {
+      'key_id': keyId,
+      'client_data_hash': clientDataHash,
+    });
+
+    if (result == null) {
+      throw PlatformException(
+        code: 'app_attest_failed',
+        message: 'Native generate_assertion returned null',
+      );
+    }
     return result['assertion'] as String;
   }
 }
@@ -96,16 +111,15 @@ class MethodChannelAppAttestBridge implements AppAttestBridge {
 /// A fake bridge for testing — returns deterministic values without touching
 /// the platform layer.
 class FakeAppAttestBridge implements AppAttestBridge {
-  String? _nextKeyId = 'fake-key-id';
+  int _keyCounter = 0;
   String _nextAttestation = 'fake-attestation';
   String _nextAssertion = 'fake-assertion';
 
-  void setAttestationResponse({
-    String? keyId,
-    String? attestation,
-  }) {
-    if (keyId != null) _nextKeyId = keyId;
-    if (attestation != null) _nextAttestation = attestation;
+  /// Keys generated so far, in order.
+  final List<String> generatedKeys = [];
+
+  void setAttestationResponse(String attestation) {
+    _nextAttestation = attestation;
   }
 
   void setAssertionResponse(String assertion) {
@@ -113,15 +127,22 @@ class FakeAppAttestBridge implements AppAttestBridge {
   }
 
   @override
-  Future<({String keyId, String attestation})> attest(
-    String challenge,
-  ) async {
-    final result = (keyId: _nextKeyId!, attestation: _nextAttestation);
-    return result;
+  Future<String> generateKey() async {
+    final keyId = 'fake-key-${_keyCounter++}';
+    generatedKeys.add(keyId);
+    return keyId;
   }
 
   @override
-  Future<String> assertion({
+  Future<String> attestKey({
+    required String keyId,
+    required String clientDataHash,
+  }) async {
+    return _nextAttestation;
+  }
+
+  @override
+  Future<String> generateAssertion({
     required String keyId,
     required String clientDataHash,
   }) async {
