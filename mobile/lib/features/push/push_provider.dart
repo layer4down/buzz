@@ -11,6 +11,7 @@ import '../../shared/relay/relay.dart';
 import 'apns_token_service.dart';
 import 'push_lease_service.dart';
 import 'push_models.dart';
+import 'push_preferences.dart';
 
 /// State of the push notification lifecycle.
 enum PushStatus {
@@ -256,28 +257,67 @@ class PushNotifier extends Notifier<PushState> {
   }
 
   /// Build the subscription list based on user preferences and relay support.
+  ///
+  /// Reads [PushPreferences] so the user can toggle categories in settings.
   List<PushSubscription> _buildSubscriptions(
     String pubkey,
     PushDescriptor descriptor,
   ) {
+    final prefs = ref.read(pushPreferencesProvider);
     final subs = <PushSubscription>[];
 
-    // @mentions — always on, time-sensitive.
-    if (descriptor.pushKinds.contains(9)) {
+    // @mentions — time-sensitive.
+    if (prefs.mentions && descriptor.pushKinds.contains(9)) {
       subs.add(PushSubscription.mentions(pubkey));
     }
 
-    // DMs — always on, time-sensitive.
-    if (descriptor.pushKinds.contains(1059)) {
+    // DMs — time-sensitive.
+    if (prefs.dms && descriptor.pushKinds.contains(1059)) {
       subs.add(PushSubscription.dms(pubkey));
     }
 
     // Agent activity — default priority.
-    if (descriptor.pushKinds.contains(40007)) {
+    if (prefs.agentActivity && descriptor.pushKinds.contains(40007)) {
       subs.add(PushSubscription.agentActivity(pubkey));
     }
 
     return subs;
+  }
+
+  /// Re-publish the lease with updated subscriptions after preference changes.
+  ///
+  /// Called from the settings UI when the user toggles a category. If push
+  /// is not active, this is a no-op — the new preferences will take effect
+  /// on the next [activate].
+  Future<void> refreshSubscriptions() async {
+    if (state.status != PushStatus.active) return;
+    if (state.deviceToken == null) return;
+
+    _initService();
+
+    try {
+      final config = ref.read(relayConfigProvider);
+      final descriptor = await _leaseService.fetchDescriptor(config.baseUrl);
+      if (descriptor == null) return;
+
+      final pubkey = ref.read(myPubkeyProvider);
+      if (pubkey == null) return;
+
+      final installationId = await _getOrCreateInstallationId();
+      final generation = await _incrementGeneration();
+
+      await _leaseService.createLease(
+        deviceToken: state.deviceToken!,
+        descriptor: descriptor,
+        subscriptions: _buildSubscriptions(pubkey, descriptor),
+        installationId: installationId,
+        generation: generation,
+      );
+
+      debugPrint('Push: lease refreshed with updated preferences');
+    } catch (e) {
+      debugPrint('Push: subscription refresh failed: $e');
+    }
   }
 
   /// Generate or load the per-installation random ID (NIP-PL `d` tag).

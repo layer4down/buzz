@@ -17,11 +17,15 @@ import '../../shared/widgets/app_list_card.dart';
 import '../../shared/widgets/frosted_app_bar.dart';
 import '../../shared/widgets/frosted_scaffold.dart';
 import '../../shared/widgets/modal_presentation.dart';
+import '../push/push_models.dart';
+import '../push/push_preferences.dart';
+import '../push/push_provider.dart';
 import 'accent_picker_page.dart';
 import 'theme_picker_page.dart';
 
 part 'settings_page/appearance_section.dart';
 part 'settings_page/connection_section.dart';
+part 'settings_page/notifications_section.dart';
 
 class SettingsPage extends HookConsumerWidget {
   const SettingsPage({
@@ -72,6 +76,7 @@ class SettingsPage extends HookConsumerWidget {
               children: [
                 profileHeader,
                 const _AppearanceSection(),
+                const _NotificationsSection(),
                 _ConnectionSection(
                   identityRecoveryPageBuilder: identityRecoveryPageBuilder,
                 ),
