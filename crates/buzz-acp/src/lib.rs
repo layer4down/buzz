@@ -3360,6 +3360,17 @@ fn is_auth_error(error: &acp::AcpError) -> bool {
     message.contains("Re-authenticate") || message.contains("API Error: 401")
 }
 
+/// JSON-RPC -32603 Internal Error: the agent process itself suffered an
+/// internal failure (e.g. dead upstream connection after extended operation,
+/// corrupted session state). Unlike application-level AgentErrors (e.g. a bad
+/// LLM response that the agent caught cleanly), this means the process is
+/// **poisoned** — the stdio pipe may be intact but the session running on it
+/// is not recoverable. The agent must be respawned so the next session starts
+/// on a fresh process.
+fn is_process_poisoning_error(error: &acp::AcpError) -> bool {
+    matches!(error, acp::AcpError::AgentError { code: -32603, .. })
+}
+
 /// Spawn a task that posts a user-visible failure notice to the relay.
 ///
 /// Shared by the hard-cap immediate dead-letter path and the retries-exhausted
@@ -3671,16 +3682,22 @@ fn handle_prompt_result(
                 }
             }
         }
-        // Errors fall into two categories:
+        // Errors fall into three categories:
         //
         // 1. Transport-class (Io, WriteTimeout, Timeout, Protocol): the stdio
         //    pipe may be corrupted or the agent desynchronized. These are fatal
         //    to the agent regardless of whether they occurred during session
         //    creation or an active prompt — respawn unconditionally.
         //
-        // 2. Application-class (IdleTimeout, HardTimeout, Json): the pipe is
-        //    intact but the prompt failed. Return the agent to the pool so it
-        //    can be reused for the next event.
+        // 2. Process-poisoning (AgentError -32603 Internal Error): the pipe is
+        //    intact but the agent process itself suffered an internal failure
+        //    (e.g. dead upstream LLM connection after extended single-session
+        //    operation). The session is not recoverable — respawn so the next
+        //    session starts on a fresh process.
+        //
+        // 3. Application-class (other AgentError, IdleTimeout, HardTimeout,
+        //    Json): the pipe is intact and the process is healthy. Return the
+        //    agent to the pool so it can be reused for the next event.
 
         // Intentional cancel — agent is healthy, return it to the pool.
         // No respawn, no retry penalty. The cancelled batch was already stored
@@ -3703,7 +3720,7 @@ fn handle_prompt_result(
                     | acp::AcpError::WriteTimeout(_)
                     | acp::AcpError::Timeout(_)
                     | acp::AcpError::Protocol(_)
-            );
+            ) || is_process_poisoning_error(e);
             let error_code = match &e {
                 acp::AcpError::AgentError { code, .. } => Some(*code),
                 _ => None,
@@ -3715,7 +3732,7 @@ fn handle_prompt_result(
                     configured_model = %harness_configured_model,
                     pid = harness_pid,
                     error = %e,
-                    "transport/protocol error — respawning agent"
+                    "transport/protocol/process-poisoning error — respawning agent"
                 );
                 emit_turn_error(&e.to_string(), error_code);
 
@@ -7426,6 +7443,49 @@ mod error_outcome_emission_tests {
         assert!(
             !is_auth_error(&timeout),
             "WriteTimeout must not be classified as auth error"
+        );
+    }
+
+    // ── is_process_poisoning_error classification ─────────────────────────
+
+    #[test]
+    fn is_process_poisoning_error_matches_internal_error() {
+        let e = acp::AcpError::AgentError {
+            code: -32603,
+            message: "Internal error: upstream connection closed".to_string(),
+        };
+        assert!(
+            is_process_poisoning_error(&e),
+            "JSON-RPC -32603 must be classified as process-poisoning"
+        );
+    }
+
+    #[test]
+    fn is_process_poisoning_error_rejects_other_agent_errors() {
+        let method_not_found = acp::AcpError::AgentError {
+            code: -32601,
+            message: "Method not found".to_string(),
+        };
+        assert!(
+            !is_process_poisoning_error(&method_not_found),
+            "-32601 (method not found) must NOT be process-poisoning"
+        );
+        let server_error = acp::AcpError::AgentError {
+            code: -32000,
+            message: "Usage credits required".to_string(),
+        };
+        assert!(
+            !is_process_poisoning_error(&server_error),
+            "-32000 (generic server error) must NOT be process-poisoning"
+        );
+    }
+
+    #[test]
+    fn is_process_poisoning_error_rejects_transport_errors() {
+        let io = acp::AcpError::Io(std::io::Error::other("pipe broke"));
+        assert!(
+            !is_process_poisoning_error(&io),
+            "I/O error must not be classified as process-poisoning"
         );
     }
 

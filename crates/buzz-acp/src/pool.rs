@@ -2330,10 +2330,18 @@ pub async fn run_prompt_task(
         }
         Err(e) => {
             tracing::error!(target: "pool::prompt", "session_prompt error: {e}");
-            // AgentError means the agent caught a problem before mutating
-            // session state (e.g. bad LLM response). The session is healthy —
-            // don't invalidate it. Other errors may have corrupted state.
-            if !matches!(e, AcpError::AgentError { .. }) {
+            // AgentError usually means the agent caught a problem before mutating
+            // session state (e.g. bad LLM response) — the session is healthy.
+            // Exception: JSON-RPC -32603 Internal Error means the agent process
+            // itself suffered an internal failure (dead LLM connection, corrupted
+            // state). The session is NOT healthy — invalidate it so the next turn
+            // creates a fresh session (and the pool respawns the process, see
+            // is_process_poisoning_error in lib.rs).
+            let is_recoverable_agent_error = matches!(
+                e,
+                AcpError::AgentError { code, .. } if code != -32603
+            );
+            if !is_recoverable_agent_error {
                 agent.state.invalidate(&source);
             }
             let usage = agent.acp.take_turn_usage();
