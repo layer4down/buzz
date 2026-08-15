@@ -215,6 +215,13 @@ pub struct AcpClient {
     /// deltas. Both goose and buzz-agent emit this notification; goose gates
     /// on client capability advertisement, buzz-agent emits unconditionally.
     goose_usage: UsageTracker,
+    /// Concatenated text of the most recent turn's `agent_message_chunk`
+    /// stream. Captured by [`handle_session_update`](Self::handle_session_update)
+    /// and read via [`last_assistant_message`](Self::last_assistant_message).
+    /// Normally the harness never needs the reply text (agents post via the
+    /// CLI themselves); the persona invariant probe is the one consumer.
+    /// Cleared at the start of each `session/prompt` turn.
+    last_assistant_message: String,
 }
 
 /// Recursively merge `overlay` into `base`, with `overlay` winning on scalar/shape
@@ -564,6 +571,7 @@ impl AcpClient {
             steering_supported: false,
             steer_rx: None,
             goose_usage: UsageTracker::default(),
+            last_assistant_message: String::new(),
         })
     }
 
@@ -586,6 +594,17 @@ impl AcpClient {
     /// Return the pool slot index for this agent process.
     pub(crate) fn observer_agent_index(&self) -> Option<usize> {
         self.observer_agent_index
+    }
+
+    /// Return the concatenated text of the most recent turn's assistant
+    /// message, or `None` when the agent produced no text. The stream is
+    /// cleared when the next `session/prompt` is sent.
+    pub fn last_assistant_message(&self) -> Option<String> {
+        if self.last_assistant_message.is_empty() {
+            None
+        } else {
+            Some(self.last_assistant_message.clone())
+        }
     }
 
     /// Emit a semantic event to the local observer feed, if enabled.
@@ -766,6 +785,8 @@ impl AcpClient {
         max_duration: std::time::Duration,
     ) -> Result<StopReason, AcpError> {
         let params = build_prompt_params(session_id, prompt_blocks);
+        // New turn — the previous turn's captured reply text is stale.
+        self.last_assistant_message.clear();
         let hard_deadline = tokio::time::Instant::now() + max_duration;
         self.current_hard_deadline = Some(hard_deadline);
 
@@ -1728,6 +1749,7 @@ impl AcpClient {
         match update_type {
             "agent_message_chunk" => {
                 if let Some(text) = update["content"]["text"].as_str() {
+                    self.last_assistant_message.push_str(text);
                     tracing::info!(target: "acp::stream", "{text}");
                 }
                 false

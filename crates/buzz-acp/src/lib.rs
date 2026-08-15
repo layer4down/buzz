@@ -5,6 +5,7 @@ mod config;
 mod engram_fetch;
 mod filter;
 mod observer;
+mod persona_check;
 mod pool;
 mod pool_lifecycle;
 mod queue;
@@ -3722,7 +3723,7 @@ fn spawn_respawn_task(
     true
 }
 
-fn normalized_agent_name(init_result: &serde_json::Value) -> String {
+pub(crate) fn normalized_agent_name(init_result: &serde_json::Value) -> String {
     init_result
         .get("agentInfo")
         .or_else(|| init_result.get("serverInfo"))
@@ -3761,6 +3762,8 @@ struct PoolStartup {
     has_generated_codex_config: bool,
     model: Option<String>,
     observer: Option<observer::ObserverHandle>,
+    persona_check: config::PersonaCheckMode,
+    system_prompt: Option<String>,
 }
 
 impl PoolStartup {
@@ -3773,14 +3776,99 @@ impl PoolStartup {
             has_generated_codex_config: config.has_generated_codex_config,
             model: config.model.clone(),
             observer,
+            persona_check: config.persona_check,
+            system_prompt: config.system_prompt.clone(),
         }
     }
+}
+
+/// Run the persona-split invariant probe per the configured mode.
+///
+/// Abort (return Err) on a detected mismatch in `Enforce` mode; log loudly
+/// and continue otherwise. `Indeterminate` outcomes never abort — the check
+/// must not turn "adapter is slow" into "fleet stays down". Skipped outcomes
+/// log at info: they are expected for legacy-framing agents and agents with
+/// no persona at all.
+async fn run_persona_check(
+    startup: &PoolStartup,
+    mut shutdown: Option<watch::Receiver<()>>,
+) -> Result<()> {
+    use config::PersonaCheckMode;
+    if startup.persona_check == PersonaCheckMode::Off {
+        return Ok(());
+    }
+
+    let probe = tokio::select! {
+        biased;
+        _ = async {
+            match shutdown.as_mut() {
+                Some(rx) => rx.changed().await.ok(),
+                None => std::future::pending().await,
+            }
+        } => {
+            return Err(anyhow::anyhow!("persona check cancelled by shutdown"));
+        }
+        result = AcpClient::spawn(
+            &startup.command,
+            &startup.args,
+            &startup.extra_env,
+            startup.has_generated_codex_config,
+        ) => match result {
+            Ok(acp) => acp,
+            Err(e) => {
+                // The pool spawn below will hit the same failure and report it
+                // with full context; treat as indeterminate here.
+                tracing::warn!(
+                    "persona check: probe adapter failed to spawn ({e}) — continuing; pool startup will surface the underlying failure"
+                );
+                return Ok(());
+            }
+        },
+    };
+
+    // check_persona only reads `system_prompt`; build a minimal Config via
+    // the same internal constructor the config tests use, substituting the
+    // harness's intended persona.
+    let probe_config = config::Config::for_persona_check(startup.system_prompt.clone());
+    let outcome = persona_check::check_persona(probe, &probe_config).await;
+
+    match outcome {
+        persona_check::PersonaCheckOutcome::Verified => {
+            tracing::info!("persona check: verified — intended system prompt reached the model");
+        }
+        persona_check::PersonaCheckOutcome::Mismatch { reply_excerpt } => {
+            let msg = format!(
+                "persona check FAILED: the adapter answered the startup probe but did not echo the nonce — the intended persona ({}) did not serve the turn. A downstream config source may have substituted another persona. Reply excerpt: {reply_excerpt}",
+                startup
+                    .system_prompt
+                    .as_ref()
+                    .map(|p| format!("{} chars", p.len()))
+                    .unwrap_or_else(|| "none".into()),
+            );
+            if startup.persona_check == PersonaCheckMode::Enforce {
+                return Err(anyhow::anyhow!("{msg}"));
+            }
+            tracing::error!("{msg} (continuing — BUZZ_ACP_PERSONA_CHECK=warn)");
+        }
+        persona_check::PersonaCheckOutcome::Indeterminate { reason } => {
+            tracing::warn!("persona check indeterminate: {reason} — continuing");
+        }
+        persona_check::PersonaCheckOutcome::Skipped { reason } => {
+            tracing::info!("persona check skipped: {reason}");
+        }
+    }
+    Ok(())
 }
 
 async fn initialize_agent_pool(
     startup: &PoolStartup,
     mut shutdown: Option<watch::Receiver<()>>,
 ) -> Result<AgentPool> {
+    // Persona-split startup invariant — run before any slot serves a turn so
+    // a wrong-persona agent never acts. Both the eager path and every lazy
+    // wake funnel through here, so retries re-verify too.
+    run_persona_check(startup, shutdown.clone()).await?;
+
     // One agent failing to start must not kill the whole pool.
     // Attempt each spawn under a 60-second timeout; a partial pool is valid.
     let mut agent_slots: Vec<Option<OwnedAgent>> = Vec::with_capacity(startup.agents as usize);
@@ -5035,6 +5123,7 @@ mod build_mcp_servers_tests {
             relay_observer: false,
             lazy_pool: false,
             single_session: false,
+            persona_check: config::PersonaCheckMode::Off,
             agent_owner: None,
             no_base_prompt: false,
             base_prompt_content: None,
@@ -5257,6 +5346,7 @@ mod error_outcome_emission_tests {
             relay_observer: false,
             lazy_pool: false,
             single_session: false,
+            persona_check: config::PersonaCheckMode::Off,
             agent_owner: None,
             no_base_prompt: false,
             base_prompt_content: None,

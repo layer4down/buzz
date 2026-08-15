@@ -47,6 +47,17 @@ pub enum ConfigError {
     ConfigFile(String),
 }
 
+/// Persona-split startup invariant enforcement mode.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, clap::ValueEnum)]
+pub enum PersonaCheckMode {
+    /// Run the nonce-echo probe and abort startup on a detected mismatch.
+    Enforce,
+    /// Run the probe and log loudly on mismatch, but continue startup.
+    Warn,
+    /// Skip the probe entirely.
+    Off,
+}
+
 #[derive(Debug, Clone, PartialEq, clap::ValueEnum)]
 pub enum SubscribeMode {
     Mentions,
@@ -418,6 +429,19 @@ pub struct CliArgs {
     )]
     pub base_prompt_file: Option<PathBuf>,
 
+    /// Persona-split startup invariant: before serving any turn, probe the
+    /// adapter with a nonce-echo challenge to verify the intended system
+    /// prompt actually reached the model. On mismatch, refuse to start.
+    /// `enforce` (default) aborts startup; `warn` logs loudly and continues;
+    /// `off` skips the probe entirely.
+    #[arg(
+        long,
+        env = "BUZZ_ACP_PERSONA_CHECK",
+        default_value = "enforce",
+        value_enum
+    )]
+    pub persona_check: PersonaCheckMode,
+
     /// Desired LLM model ID. Applied to every new ACP session after creation.
     /// Use `buzz-acp models` to discover available model IDs.
     #[arg(long, env = "BUZZ_ACP_MODEL")]
@@ -565,6 +589,8 @@ pub struct Config {
     /// session per connection (e.g. prime-agent). Context rides via the embedded
     /// prompt, not per-session state.
     pub single_session: bool,
+    /// Persona-split startup invariant mode. See `--persona-check`.
+    pub persona_check: PersonaCheckMode,
     /// Agent owner pubkey (hex). Used for `--respond-to=owner-only` gate.
     /// Replaces the old REST-based owner lookup.
     pub agent_owner: Option<String>,
@@ -834,6 +860,56 @@ pub fn propagate_legacy_env_vars() {
 }
 
 impl Config {
+    /// Minimal Config carrying only a system prompt, for the persona-split
+    /// startup probe (`crate::persona_check`). The probe reads nothing but
+    /// `system_prompt`; every other field holds a placeholder value.
+    pub(crate) fn for_persona_check(system_prompt: Option<String>) -> Self {
+        Self {
+            keys: nostr::Keys::generate(),
+            relay_url: "ws://localhost:3000".into(),
+            agent_command: String::new(),
+            agent_args: vec![],
+            mcp_command: String::new(),
+            idle_timeout_secs: DEFAULT_IDLE_TIMEOUT_SECS,
+            max_turn_duration_secs: DEFAULT_MAX_TURN_DURATION_SECS,
+            agents: 1,
+            heartbeat_interval_secs: 0,
+            turn_liveness_secs: 10,
+            heartbeat_prompt: None,
+            system_prompt,
+            team_instructions: None,
+            initial_message: None,
+            subscribe_mode: SubscribeMode::Mentions,
+            dedup_mode: DedupMode::Queue,
+            multiple_event_handling: MultipleEventHandling::Queue,
+            ignore_self: true,
+            kinds_override: None,
+            channels_override: None,
+            no_mention_filter: false,
+            config_path: PathBuf::from("./buzz-acp.toml"),
+            context_message_limit: 12,
+            max_turns_per_session: 0,
+            presence_enabled: false,
+            typing_enabled: false,
+            memory_enabled: false,
+            model: None,
+            session_title: None,
+            permission_mode: PermissionMode::BypassPermissions,
+            respond_to: RespondTo::Anyone,
+            respond_to_allowlist: HashSet::new(),
+            allowed_respond_to: Vec::new(),
+            persona_env_vars: vec![],
+            has_generated_codex_config: false,
+            relay_observer: false,
+            lazy_pool: false,
+            single_session: false,
+            persona_check: PersonaCheckMode::Off,
+            agent_owner: None,
+            no_base_prompt: false,
+            base_prompt_content: None,
+        }
+    }
+
     pub fn from_cli() -> Result<Self, ConfigError> {
         // Legacy env-var propagation is intentionally NOT done here.
         // Call `propagate_legacy_env_vars()` before the tokio runtime starts
@@ -1113,6 +1189,7 @@ impl Config {
             relay_observer: args.relay_observer,
             lazy_pool: args.lazy_pool,
             single_session: args.single_session,
+            persona_check: args.persona_check,
             agent_owner: args.agent_owner.map(|s| s.trim().to_ascii_lowercase()),
             no_base_prompt: args.no_base_prompt,
             base_prompt_content,
@@ -1485,6 +1562,7 @@ mod tests {
             relay_observer: false,
             lazy_pool: false,
             single_session: false,
+            persona_check: PersonaCheckMode::Off,
             agent_owner: None,
             no_base_prompt: false,
             base_prompt_content: None,
