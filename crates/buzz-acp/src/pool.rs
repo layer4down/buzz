@@ -1175,17 +1175,34 @@ async fn apply_permission_mode(
 /// Agents with `protocol_version >= 2`, or any agent without a `base_prompt`,
 /// get `body` unchanged. The gate lives here so the heartbeat and
 /// initial-message dispatch paths can't drift apart again.
-pub(crate) fn prepend_base_for_legacy(
+/// Legacy-framing framing injection: prepend `[Base]` and, when present,
+/// `[System]` (the persona) ahead of a body that does not go through
+/// `format_prompt`. `format_prompt` already injects both for legacy agents
+/// on channel batches; this is the non-batch path (heartbeat, initial
+/// message). Injecting the persona here is what makes legacy agents
+/// actually immune to the persona-split class on every turn — the 8/12
+/// Lens incident ran through a heartbeat that carried base but no persona.
+pub(crate) fn prepend_framing_for_legacy(
     protocol_version: u32,
     base_prompt: Option<&str>,
+    system_prompt: Option<&str>,
     body: &str,
 ) -> String {
-    match base_prompt {
-        Some(bp) if protocol_version < 2 => {
-            format!("{}\n\n{body}", crate::queue::base_section(bp))
-        }
-        _ => body.to_string(),
+    if protocol_version >= 2 {
+        return body.to_string();
     }
+    let mut sections: Vec<String> = Vec::with_capacity(2);
+    if let Some(bp) = base_prompt {
+        sections.push(crate::queue::base_section(bp));
+    }
+    if let Some(sp) = system_prompt {
+        sections.push(format!("[System]\n{sp}"));
+    }
+    if sections.is_empty() {
+        return body.to_string();
+    }
+    sections.push(body.to_string());
+    sections.join("\n\n")
 }
 
 /// Prepend the `[Channel Canvas]` section to the legacy initial-message body.
@@ -1622,103 +1639,103 @@ pub async fn run_prompt_task(
         }
     } else {
         match &source {
-        PromptSource::Channel(cid) => {
-            if let Some(sid) = agent.state.sessions.get(cid) {
-                (sid.clone(), false)
-            } else {
-                // The title is channel-qualified (`Agent · #channel`) so one
-                // agent in several channels doesn't produce identical session
-                // rows; `title_channel` comes from the single resolve above and
-                // is `None` for DM, unresolved, and unnamed channels.
-                match create_session_and_apply_model(
-                    &mut agent,
-                    &ctx,
-                    agent_core.as_deref(),
-                    agent_canvas.as_deref(),
-                    title_channel.as_deref(),
-                )
-                .await
-                {
-                    Ok(sid) => {
-                        tracing::info!(
-                            target: "pool::session",
-                            "created session {sid} for channel {cid}"
-                        );
-                        agent.state.sessions.insert(*cid, sid.clone());
-                        // Commit canvas only after session creation succeeds (I3).
-                        if let Some((pending_cid, section)) = pending_canvas.take() {
-                            agent.state.canvas_sections.insert(pending_cid, section);
+            PromptSource::Channel(cid) => {
+                if let Some(sid) = agent.state.sessions.get(cid) {
+                    (sid.clone(), false)
+                } else {
+                    // The title is channel-qualified (`Agent · #channel`) so one
+                    // agent in several channels doesn't produce identical session
+                    // rows; `title_channel` comes from the single resolve above and
+                    // is `None` for DM, unresolved, and unnamed channels.
+                    match create_session_and_apply_model(
+                        &mut agent,
+                        &ctx,
+                        agent_core.as_deref(),
+                        agent_canvas.as_deref(),
+                        title_channel.as_deref(),
+                    )
+                    .await
+                    {
+                        Ok(sid) => {
+                            tracing::info!(
+                                target: "pool::session",
+                                "created session {sid} for channel {cid}"
+                            );
+                            agent.state.sessions.insert(*cid, sid.clone());
+                            // Commit canvas only after session creation succeeds (I3).
+                            if let Some((pending_cid, section)) = pending_canvas.take() {
+                                agent.state.canvas_sections.insert(pending_cid, section);
+                            }
+                            (sid, true)
                         }
-                        (sid, true)
-                    }
-                    Err(AcpError::AgentExited) => {
-                        agent.state.invalidate_all();
-                        send_prompt_result(
-                            &result_tx,
-                            &turn_id,
-                            agent,
-                            source,
-                            PromptOutcome::AgentExited,
-                            requeue_batch_if_queue(&ctx, batch),
-                        );
-                        return;
-                    }
-                    Err(e) => {
-                        // Session creation failed; pending canvas was never committed,
-                        // so the next retry will re-fetch a fresh revision.
-                        send_prompt_result(
-                            &result_tx,
-                            &turn_id,
-                            agent,
-                            source,
-                            PromptOutcome::Error(e),
-                            requeue_batch_if_queue(&ctx, batch),
-                        );
-                        return;
-                    }
-                }
-            }
-        }
-        PromptSource::Heartbeat => {
-            if let Some(sid) = &agent.state.heartbeat_session {
-                (sid.clone(), false)
-            } else {
-                match create_session_and_apply_model(&mut agent, &ctx, None, None, None).await {
-                    Ok(sid) => {
-                        tracing::info!(
-                            target: "pool::session",
-                            "created heartbeat session {sid} for agent {}",
-                            agent.index
-                        );
-                        agent.state.heartbeat_session = Some(sid.clone());
-                        (sid, true)
-                    }
-                    Err(AcpError::AgentExited) => {
-                        agent.state.invalidate_all();
-                        send_prompt_result(
-                            &result_tx,
-                            &turn_id,
-                            agent,
-                            source,
-                            PromptOutcome::AgentExited,
-                            None,
-                        );
-                        return;
-                    }
-                    Err(e) => {
-                        send_prompt_result(
-                            &result_tx,
-                            &turn_id,
-                            agent,
-                            source,
-                            PromptOutcome::Error(e),
-                            None,
-                        );
-                        return;
+                        Err(AcpError::AgentExited) => {
+                            agent.state.invalidate_all();
+                            send_prompt_result(
+                                &result_tx,
+                                &turn_id,
+                                agent,
+                                source,
+                                PromptOutcome::AgentExited,
+                                requeue_batch_if_queue(&ctx, batch),
+                            );
+                            return;
+                        }
+                        Err(e) => {
+                            // Session creation failed; pending canvas was never committed,
+                            // so the next retry will re-fetch a fresh revision.
+                            send_prompt_result(
+                                &result_tx,
+                                &turn_id,
+                                agent,
+                                source,
+                                PromptOutcome::Error(e),
+                                requeue_batch_if_queue(&ctx, batch),
+                            );
+                            return;
+                        }
                     }
                 }
             }
-        }
+            PromptSource::Heartbeat => {
+                if let Some(sid) = &agent.state.heartbeat_session {
+                    (sid.clone(), false)
+                } else {
+                    match create_session_and_apply_model(&mut agent, &ctx, None, None, None).await {
+                        Ok(sid) => {
+                            tracing::info!(
+                                target: "pool::session",
+                                "created heartbeat session {sid} for agent {}",
+                                agent.index
+                            );
+                            agent.state.heartbeat_session = Some(sid.clone());
+                            (sid, true)
+                        }
+                        Err(AcpError::AgentExited) => {
+                            agent.state.invalidate_all();
+                            send_prompt_result(
+                                &result_tx,
+                                &turn_id,
+                                agent,
+                                source,
+                                PromptOutcome::AgentExited,
+                                None,
+                            );
+                            return;
+                        }
+                        Err(e) => {
+                            send_prompt_result(
+                                &result_tx,
+                                &turn_id,
+                                agent,
+                                source,
+                                PromptOutcome::Error(e),
+                                None,
+                            );
+                            return;
+                        }
+                    }
+                }
+            }
         }
     };
     agent.acp.set_observer_context(observer::context_for_turn(
@@ -1751,13 +1768,14 @@ pub async fn run_prompt_task(
             // Canvas is also injected here for legacy agents: protocol-v2 agents
             // already have it in systemPrompt; legacy agents need it before the
             // first prompt, matching the "every turn" per-turn delivery semantics.
-            let init_msg = prepend_base_for_legacy(
+            let init_msg = prepend_framing_for_legacy(
                 if agent.has_system_prompt_support() {
                     2
                 } else {
                     1
                 },
                 ctx.base_prompt,
+                ctx.system_prompt.as_deref(),
                 initial_msg,
             );
             let init_msg = prepend_canvas_for_legacy(
@@ -1889,13 +1907,14 @@ pub async fn run_prompt_task(
     let prompt_sections: Vec<String> = if let Some(text) = prompt_text {
         // Heartbeats create their session before this point, so a Goose method-not-found
         // probe has already selected the correct framing for this process.
-        let text = prepend_base_for_legacy(
+        let text = prepend_framing_for_legacy(
             if agent.has_system_prompt_support() {
                 2
             } else {
                 1
             },
             ctx.base_prompt,
+            ctx.system_prompt.as_deref(),
             &text,
         );
         vec![text]
@@ -3830,7 +3849,8 @@ mod tests {
     fn test_initial_message_legacy_agent_gets_base_prepended() {
         // protocol_version 1 + Some(base_prompt): [Base] rides along in the
         // user message, composed as `[Base]\n{bp}\n\n{initial_msg}`.
-        let composed = prepend_base_for_legacy(1, Some("you are a helpful agent"), "hello channel");
+        let composed =
+            prepend_framing_for_legacy(1, Some("you are a helpful agent"), None, "hello channel");
         assert_eq!(composed, "[Base]\nyou are a helpful agent\n\nhello channel");
         assert!(composed.starts_with("[Base]\nyou are a helpful agent\n\n"));
     }
@@ -3839,7 +3859,8 @@ mod tests {
     fn test_initial_message_modern_agent_omits_base() {
         // protocol_version 2 receives base_prompt via session/new, so the user
         // message is left untouched even when a base_prompt is present.
-        let composed = prepend_base_for_legacy(2, Some("you are a helpful agent"), "hello channel");
+        let composed =
+            prepend_framing_for_legacy(2, Some("you are a helpful agent"), None, "hello channel");
         assert_eq!(composed, "hello channel");
     }
 
@@ -3867,7 +3888,7 @@ mod tests {
     #[test]
     fn test_initial_message_legacy_agent_without_base_is_unchanged() {
         // No base_prompt configured: nothing to prepend regardless of version.
-        let composed = prepend_base_for_legacy(1, None, "hello channel");
+        let composed = prepend_framing_for_legacy(1, None, None, "hello channel");
         assert_eq!(composed, "hello channel");
     }
 
@@ -3910,6 +3931,63 @@ mod tests {
     }
 
     #[test]
+    fn test_legacy_heartbeat_includes_persona() {
+        // The 8/12 Lens incident shape: legacy (v1) harness, heartbeat turn.
+        // The persona MUST ride in the framed body — base alone is not
+        // enough, or the runtime falls back to its own resolved persona.
+        let composed = prepend_framing_for_legacy(
+            1,
+            Some("base prompt"),
+            Some("You are Lens, the code reviewer."),
+            "heartbeat: report status",
+        );
+        assert!(
+            composed.contains("[System]\nYou are Lens, the code reviewer."),
+            "persona must be injected into legacy heartbeat framing: {composed}"
+        );
+        assert!(
+            composed.contains("[Base]"),
+            "base prompt must still be injected: {composed}"
+        );
+        assert!(
+            composed.ends_with("heartbeat: report status"),
+            "body must remain last: {composed}"
+        );
+    }
+
+    #[test]
+    fn test_legacy_heartbeat_without_persona_keeps_base_only() {
+        let composed = prepend_framing_for_legacy(1, Some("base prompt"), None, "hb");
+        assert!(composed.contains("[Base]"));
+        assert!(!composed.contains("[System]"));
+    }
+
+    #[test]
+    fn test_legacy_framing_without_either_passes_body_through() {
+        assert_eq!(prepend_framing_for_legacy(1, None, None, "hb"), "hb");
+    }
+
+    #[test]
+    fn test_v2_agent_heartbeat_gets_no_persona_injection() {
+        // Protocol-v2 agents receive the persona via the system role in
+        // session/new; injecting [System] into the body would duplicate it.
+        let composed = prepend_framing_for_legacy(2, Some("base"), Some("persona"), "hb");
+        assert_eq!(composed, "hb", "v2 framing must pass body through");
+    }
+
+    #[test]
+    fn test_legacy_framing_order_base_then_system_then_body() {
+        let composed = prepend_framing_for_legacy(1, Some("B"), Some("S"), "X");
+        let base_pos = composed.find("[Base]").expect("base present");
+        let sys_pos = composed.find("[System]").expect("system present");
+        let body_pos = composed.rfind("X").expect("body present");
+        assert!(
+            base_pos < sys_pos && sys_pos < body_pos,
+            "order wrong: {composed}"
+        );
+    }
+
+    #[test]
     fn test_initial_message_legacy_agent_no_canvas_is_unchanged() {
         // No canvas present: body passes through unmodified.
         let composed = prepend_canvas_for_legacy(1, None, "do the thing");
@@ -3921,7 +3999,7 @@ mod tests {
         // Verify the full composition order when both base and canvas are present:
         // [Base] → canvas section → initial-message body.
         let canvas = "[Channel Canvas]\ncanvas content";
-        let base_composed = prepend_base_for_legacy(1, Some("be helpful"), "do the thing");
+        let base_composed = prepend_framing_for_legacy(1, Some("be helpful"), None, "do the thing");
         let full = prepend_canvas_for_legacy(1, Some(canvas), &base_composed);
         assert!(
             full.starts_with("[Channel Canvas]"),
