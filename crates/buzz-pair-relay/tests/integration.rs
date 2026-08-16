@@ -76,14 +76,18 @@ async fn try_recv(ws: &mut WS) -> Option<Message> {
 
 /// Assert the connection is closed (stream ends) within 2 seconds.
 async fn assert_closed(ws: &mut WS) {
-    let result = tokio::time::timeout(Duration::from_secs(2), ws.next()).await;
-    match result {
-        Err(_) => panic!("connection did not close within 2 s"),
-        Ok(None) => {}                        // clean EOF
-        Ok(Some(Ok(Message::Close(_)))) => {} // close frame
-        Ok(Some(Err(_))) => {}                // protocol error / reset
-        Ok(Some(Ok(other))) => panic!("expected close, got {:?}", other),
+    for _ in 0..40 {
+        let result = tokio::time::timeout(Duration::from_millis(50), ws.next()).await;
+        match result {
+            Err(_) => continue,                   // this 50ms slice timed out
+            Ok(None) => {}                        // clean EOF
+            Ok(Some(Ok(Message::Close(_)))) => {} // close frame
+            Ok(Some(Err(_))) => {}                // protocol error / reset
+            Ok(Some(Ok(other))) => panic!("expected close, got {:?}", other),
+        }
+        return;
     }
+    panic!("connection did not close within 2 s");
 }
 
 /// Generate a random keypair; returns `(SecretKey, pubkey_hex)`.
