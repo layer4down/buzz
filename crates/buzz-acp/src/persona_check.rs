@@ -16,6 +16,16 @@
 //! silently substituted its own persona fails the echo and the harness
 //! refuses to start.
 //!
+//! The nonce exists **only in the system prompt**. The user message carries
+//! the prefix at most, never the token — a substituted runtime that ignores
+//! our systemPrompt still receives the user message, and any compliant model
+//! would obediently echo a nonce handed to it there, false-Verifying the
+//! exact incident this gate exists to catch. Reply classification is
+//! three-way: real nonce → Verified; a prefix-shaped token that is not the
+//! nonce → Mismatch (fabricated); no token-shaped reply at all → one retry,
+//! then Indeterminate (noncompliant-honest and substituted-runtime are
+//! indistinguishable there).
+//!
 //! Failure policy: a **detected mismatch always blocks** (that is the gate).
 //! Infrastructure failure — adapter cannot spawn, session cannot be created,
 //! turn times out — downgrades to a loud warning because the check must not
@@ -76,12 +86,32 @@ this token and nothing else: {nonce}"
     )
 }
 
-/// Build the probe's user prompt.
-fn probe_user_prompt(nonce: &str) -> String {
+/// Build the probe's user prompt. Prefix hint only — the nonce itself must
+/// never appear here, or a runtime that dropped our systemPrompt can still
+/// pass the echo by parroting the user message.
+fn probe_user_prompt() -> String {
     format!(
         "Reply with the startup verification token from your instructions. \
-The token starts with {NONCE_PREFIX}. Output only the token: {nonce}"
+The token starts with {NONCE_PREFIX} followed by hexadecimal characters, a \
+hyphen, and digits. Output only the token and nothing else."
     )
+}
+
+/// Does `reply` look like a nonce (prefix + hex + '-' + digits)?
+fn is_token_shaped(reply: &str) -> bool {
+    fn is_hex_or_digit(c: char) -> bool {
+        c.is_ascii_hexdigit() || c.is_ascii_digit()
+    }
+    let Some(rest) = reply.trim().strip_prefix(NONCE_PREFIX) else {
+        return false;
+    };
+    let Some((hex_part, pid_part)) = rest.split_once('-') else {
+        return false;
+    };
+    !hex_part.is_empty()
+        && hex_part.chars().all(is_hex_or_digit)
+        && !pid_part.is_empty()
+        && pid_part.chars().all(|c| c.is_ascii_digit())
 }
 
 /// Run the persona invariant check against a fresh probe client.
@@ -102,7 +132,11 @@ pub(crate) async fn check_persona(acp: AcpClient, config: &Config) -> PersonaChe
             };
         }
     };
-    let protocol_version = init["protocolVersion"].as_u64().unwrap_or(1) as u32;
+    // `as_u64().unwrap_or(1)` would silently downgrade a v2 adapter that
+    // reports the version as a string — fail-open on a parse quirk, in a
+    // gate. Non-numeric/missing is treated as unknown (proceed with the
+    // check); only a numeric v1 skips.
+    let protocol_version = init["protocolVersion"].as_u64();
     let agent_name = crate::normalized_agent_name(&init);
 
     // Legacy framing (protocol v1, or goose without the system-prompt
@@ -135,7 +169,10 @@ pub(crate) async fn check_persona(acp: AcpClient, config: &Config) -> PersonaChe
                     // prompt would test our own write, not the adapter's
                     // session/new handling.
                     PersonaCheckOutcome::Skipped {
-                        reason: "goose: system-prompt extension probed on a throwaway session; run the nonce check on a fresh probe"
+                        reason: "goose: system-prompt extension present; nonce probe on a fresh \
+client is not covered in v1 — its system prompt rides the goose extension, \
+not session/new, so the session/new probe here would not exercise the real \
+persona path"
                             .into(),
                     }
                 } else {
@@ -153,14 +190,21 @@ pub(crate) async fn check_persona(acp: AcpClient, config: &Config) -> PersonaChe
             }
         }
     }
-    if protocol_version < 2 {
+    if protocol_version == Some(1) {
         acp.shutdown().await;
         return PersonaCheckOutcome::Skipped {
             reason: format!(
-                "agent {agent_name} speaks protocol v{protocol_version} with per-turn \
+                "agent {agent_name} speaks protocol v1 with per-turn \
 persona re-injection; startup substitution is structurally impossible"
             ),
         };
+    }
+    if protocol_version.is_none() {
+        tracing::warn!(
+            "persona check: agent {agent_name} reported a non-numeric or missing \
+protocolVersion ({}) — treating as unknown and running the probe",
+            init["protocolVersion"]
+        );
     }
 
     let persona = match &config.system_prompt {
@@ -194,29 +238,80 @@ persona re-injection; startup substitution is structurally impossible"
         }
     };
 
-    let turn = acp
-        .session_prompt_with_idle_timeout(
-            &session,
-            &probe_user_prompt(&nonce),
-            PROBE_IDLE_TIMEOUT,
-            PROBE_MAX_DURATION,
-        )
-        .await;
+    let user_prompt = probe_user_prompt();
+    let mut outcome = None;
+    // One retry for the no-token case: a compliant model under the right
+    // persona may still decline or ramble on the first ask.
+    for attempt in 1..=2 {
+        let turn = acp
+            .session_prompt_with_idle_timeout(
+                &session,
+                &user_prompt,
+                PROBE_IDLE_TIMEOUT,
+                PROBE_MAX_DURATION,
+            )
+            .await;
+        match turn {
+            Ok(_) => {
+                match acp.last_assistant_message() {
+                    // Real nonce echoed: the system prompt genuinely reached the
+                    // model — the only path to Verified.
+                    Some(reply) if reply.contains(&nonce) => {
+                        outcome = Some(PersonaCheckOutcome::Verified);
+                    }
+                    // Prefix-shaped but wrong token: the reply pattern-matched the
+                    // instruction it was given without knowing the nonce — the
+                    // model read the user message, not our system prompt. That is
+                    // fabrication, high-confidence mismatch.
+                    Some(reply) if is_token_shaped(&reply) => {
+                        outcome = Some(PersonaCheckOutcome::Mismatch {
+                            reply_excerpt: excerpt(&reply),
+                        });
+                    }
+                    Some(reply) => {
+                        if attempt == 1 {
+                            tracing::warn!(
+                                "persona check: attempt 1 replied without a token-shaped \
+answer ({} chars) — retrying once",
+                                reply.trim().chars().count()
+                            );
+                            continue;
+                        }
+                        outcome = Some(PersonaCheckOutcome::Indeterminate {
+                            reason: format!(
+                                "adapter answered twice but never echoed or fabricated a \
+token — cannot distinguish noncompliant-honest from substituted runtime; \
+last reply excerpt: {}",
+                                excerpt(&reply)
+                            ),
+                        });
+                    }
+                    None => {
+                        if attempt == 1 {
+                            tracing::warn!("persona check: attempt 1 produced no assistant text — retrying once");
+                            continue;
+                        }
+                        outcome = Some(PersonaCheckOutcome::Indeterminate {
+                            reason: "adapter completed two turns without any assistant text".into(),
+                        });
+                    }
+                }
+            }
+            Err(e) => {
+                outcome = Some(PersonaCheckOutcome::Indeterminate {
+                    reason: format!("probe turn failed: {e}"),
+                });
+            }
+        }
+        break;
+    }
 
-    let outcome = match turn {
-        Ok(_) => match acp.last_assistant_message() {
-            Some(reply) if reply.contains(&nonce) => PersonaCheckOutcome::Verified,
-            Some(reply) => PersonaCheckOutcome::Mismatch {
-                reply_excerpt: excerpt(&reply),
-            },
-            None => PersonaCheckOutcome::Mismatch {
-                reply_excerpt: "<no assistant text received>".into(),
-            },
-        },
-        Err(e) => PersonaCheckOutcome::Indeterminate {
-            reason: format!("probe turn failed: {e}"),
-        },
-    };
+    let outcome = outcome.unwrap_or_else(|| {
+        // Unreachable: the loop always sets `outcome` before breaking.
+        PersonaCheckOutcome::Indeterminate {
+            reason: "probe loop exited without classifying".into(),
+        }
+    });
 
     acp.shutdown().await;
     outcome
@@ -265,9 +360,28 @@ mod tests {
     }
 
     #[test]
-    fn probe_user_prompt_names_the_nonce() {
-        let prompt = probe_user_prompt("BUZZ-PERSONA-CHECK-abc-1");
-        assert!(prompt.contains("BUZZ-PERSONA-CHECK-abc-1"));
+    fn probe_user_prompt_never_contains_a_nonce() {
+        // Regression (review finding): the nonce must exist only in the
+        // system prompt. A nonce pasted into the user message lets a
+        // substituted runtime pass by parroting it.
+        let prompt = probe_user_prompt();
+        assert!(prompt.contains(NONCE_PREFIX), "carries the prefix hint");
+        // No full nonce shape (prefix + hex + '-' + digits) may appear.
+        assert!(
+            !is_token_shaped(&prompt),
+            "user prompt must not itself contain a token-shaped string: {prompt}"
+        );
+    }
+
+    #[test]
+    fn token_shape_detection() {
+        assert!(is_token_shaped("BUZZ-PERSONA-CHECK-deadbeef-123"));
+        assert!(is_token_shaped("  BUZZ-PERSONA-CHECK-1-2  \n"));
+        assert!(!is_token_shaped("BUZZ-PERSONA-CHECK-")); // empty parts
+        assert!(!is_token_shaped("BUZZ-PERSONA-CHECK-xyz-1")); // non-hex body
+        assert!(!is_token_shaped("BUZZ-PERSONA-CHECK-abc-x")); // non-digit pid
+        assert!(!is_token_shaped("SOME-OTHER-TOKEN-abc-123")); // wrong prefix
+        assert!(!is_token_shaped("I could not find a token")); // no token at all
     }
 
     #[test]
@@ -304,7 +418,13 @@ mod integration_tests {
         // MODE=0: honest adapter — stores the systemPrompt and echoes the
         // nonce it found there on session/prompt.
         // MODE=1: persona-split adapter — ignores systemPrompt and answers
-        // from a persona it resolved itself (the opencode `--pure` shape).
+        //   from a persona it resolved itself (the opencode `--pure` shape).
+        // MODE=2: adversarial — ignores systemPrompt but answers like a
+        //   compliant model: echoes any token-shaped string found in the
+        //   USER message (the false-Verify shape pre-fix).
+        // MODE=3: fabricator — ignores systemPrompt, invents a prefix-shaped
+        //   token that is not the nonce.
+        // MODE=4: rambler — ignores systemPrompt, prose with no token.
         // Braces are single, not doubled: this is a plain string (no
         // format!), with the mode injected via string replacement.
         let script = r#"exec python3 -c '
@@ -340,10 +460,25 @@ for line in sys.stdin:
             stored_nonce = None  # persona split: prompt never lands
         send({"jsonrpc": "2.0", "id": rid, "result": {"sessionId": "ses_mock"}})
     elif method == "session/prompt":
+        prompt_text = " ".join(
+            (b or {}).get("text", "")
+            for b in (req.get("params") or {}).get("prompt", [])
+        )
         if MODE == 0:
             reply = stored_nonce or "i-do-not-know"
-        else:
+        elif MODE == 1:
             reply = "You are Prime-PM, the Program Manager. How can I coordinate today?"
+        elif MODE == 2:
+            # Compliant model that never saw the system prompt: parrot any
+            # token-shaped string handed over in the user message.
+            m2 = re.search(r"BUZZ-PERSONA-CHECK-[0-9a-fA-F]+-[0-9]+", prompt_text)
+            reply = m2.group(0) if m2 else (
+                "You are Prime-PM. I could not find a verification token in this message."
+            )
+        elif MODE == 3:
+            reply = "BUZZ-PERSONA-CHECK-0000dead-4194304"
+        else:
+            reply = "I am happy to help with your project coordination needs today!"
         send({"jsonrpc": "2.0", "method": "session/update", "params": {
             "sessionId": "ses_mock",
             "update": {"sessionUpdate": "agent_message_chunk",
@@ -355,7 +490,13 @@ for line in sys.stdin:
               "error": {"code": -32601, "message": "no such method"}})
 '
 "#;
-        let mode_num = if mode == "honest" { "0" } else { "1" };
+        let mode_num = match mode {
+            "honest" => "0",
+            "persona-split" => "1",
+            "adversarial" => "2",
+            "fabricator" => "3",
+            _ => "4",
+        };
         script.replace("__MODE__", mode_num)
     }
 
@@ -385,19 +526,128 @@ for line in sys.stdin:
     #[tokio::test]
     async fn persona_split_adapter_is_detected_as_mismatch() {
         // The incident shape: adapter ignores systemPrompt, serves its own
-        // resolved persona. The nonce never reaches the model, so the echo
-        // cannot contain it — detected Mismatch, not Indeterminate.
-        let acp = spawn_mock("persona-split").await;
+        // resolved persona. The wrong persona complies with the user-message
+        // instruction the only way it can — fabricating a prefix-shaped
+        // token it was never given — which is a high-confidence Mismatch.
+        // (A canned-persona prose reply no longer claims Mismatch: prose is
+        // honestly ambiguous under the three-way classification and lands
+        // Indeterminate after one retry; that path is pinned separately in
+        // `prose_only_reply_is_indeterminate_after_retry`.)
+        let acp = spawn_mock("fabricator").await;
         let outcome = check_persona(acp, &check_config(PERSONA)).await;
         match outcome {
             PersonaCheckOutcome::Mismatch { reply_excerpt } => {
                 assert!(
-                    reply_excerpt.contains("Prime-PM"),
-                    "excerpt should carry the wrong persona's reply for diagnostics: {reply_excerpt}"
+                    reply_excerpt.starts_with("BUZZ-PERSONA-CHECK-"),
+                    "excerpt should carry the fabricated token for diagnostics: {reply_excerpt}"
                 );
             }
             other => panic!("expected Mismatch, got {other:?}"),
         }
+    }
+
+    #[tokio::test]
+    async fn adversarial_echo_of_user_message_is_not_verified() {
+        // Lens's proof case, now a permanent regression test: a substituted
+        // runtime that ignores our systemPrompt but reads the user message —
+        // i.e. any compliant model — must NOT verify. Pre-fix, the nonce
+        // rode the user prompt and this adapter Verified. Now the user
+        // message carries only the prefix hint, so the adversarial reply has
+        // no token to parrot: prose answer, retry, Indeterminate. Never
+        // Verified, never a silent Mismatch fabrication.
+        let acp = spawn_mock("adversarial").await;
+        let outcome = check_persona(acp, &check_config(PERSONA)).await;
+        match outcome {
+            PersonaCheckOutcome::Indeterminate { reason } => {
+                assert!(
+                    reason.contains("never echoed"),
+                    "unexpected reason: {reason}"
+                );
+            }
+            PersonaCheckOutcome::Mismatch { .. } => {
+                // Also acceptable: a token-shaped fabrication attempt.
+            }
+            other => panic!("expected Indeterminate (or Mismatch), got {other:?}"),
+        }
+    }
+
+    #[tokio::test]
+    async fn fabricated_prefix_token_is_mismatch() {
+        // The adapter invents a token-shaped reply that matches the prefix
+        // pattern but is not the nonce: fabrication is a high-confidence
+        // mismatch — the model pattern-matched the instruction in the user
+        // message instead of reading its system prompt.
+        let acp = spawn_mock("fabricator").await;
+        let outcome = check_persona(acp, &check_config(PERSONA)).await;
+        match outcome {
+            PersonaCheckOutcome::Mismatch { reply_excerpt } => {
+                assert!(
+                    reply_excerpt.starts_with("BUZZ-PERSONA-CHECK-"),
+                    "excerpt should carry the fabricated token: {reply_excerpt}"
+                );
+            }
+            other => panic!("expected Mismatch, got {other:?}"),
+        }
+    }
+
+    #[tokio::test]
+    async fn prose_only_reply_is_indeterminate_after_retry() {
+        // No token-shaped reply at all on both attempts: noncompliant-honest
+        // and substituted-runtime are indistinguishable — Indeterminate with
+        // a loud reason, never Verified.
+        let acp = spawn_mock("rambler").await;
+        let outcome = check_persona(acp, &check_config(PERSONA)).await;
+        match outcome {
+            PersonaCheckOutcome::Indeterminate { reason } => {
+                assert!(
+                    reason.contains("never echoed") || reason.contains("without"),
+                    "unexpected reason: {reason}"
+                );
+            }
+            other => panic!("expected Indeterminate, got {other:?}"),
+        }
+    }
+
+    #[tokio::test]
+    async fn string_protocol_version_runs_check_not_skip() {
+        // Secondary review finding: `as_u64().unwrap_or(1)` silently
+        // downgraded a v2 adapter reporting protocolVersion as a string to
+        // v1 → Skipped (fail-open on a parse quirk). Non-numeric version
+        // must run the probe instead.
+        let script = r#"exec python3 -c '
+import json, sys
+def send(m):
+    sys.stdout.write(json.dumps(m) + "\n"); sys.stdout.flush()
+for line in sys.stdin:
+    line = line.strip()
+    if not line: continue
+    req = json.loads(line)
+    rid = req.get("id"); method = req.get("method")
+    if method == "initialize":
+        send({"jsonrpc":"2.0","id":rid,"result":{"protocolVersion":"2","agentInfo":{"name":"weird"}}})
+    elif method == "session/new":
+        sp = (req.get("params") or {}).get("systemPrompt", "") or ""
+        import re
+        m = re.search(r"BUZZ-PERSONA-CHECK-[0-9a-f]+-[0-9]+", sp)
+        nonce = m.group(0) if m else "i-do-not-know"
+        send({"jsonrpc":"2.0","id":rid,"result":{"sessionId":"ses_w"}})
+    elif method == "session/prompt":
+        send({"jsonrpc":"2.0","method":"session/update","params":{"sessionId":"ses_w",
+            "update":{"sessionUpdate":"agent_message_chunk","content":{"type":"text","text":nonce}}}})
+        send({"jsonrpc":"2.0","id":rid,"result":{"stopReason":"end_turn"}})
+    elif rid is not None:
+        send({"jsonrpc":"2.0","id":rid,"error":{"code":-32601,"message":"no"}})
+'
+"#;
+        let acp = AcpClient::spawn("bash", &["-c".to_string(), script.to_string()], &[], false)
+            .await
+            .expect("spawn");
+        let outcome = check_persona(acp, &check_config(PERSONA)).await;
+        assert_eq!(
+            outcome,
+            PersonaCheckOutcome::Verified,
+            "string protocolVersion must not downgrade to a v1 skip"
+        );
     }
 
     #[tokio::test]
