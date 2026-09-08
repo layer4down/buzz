@@ -235,6 +235,17 @@ async fn is_owner_or_sibling(
     is_sibling
 }
 
+/// Monotonic per-reason gate-drop counters (A6). In-memory by design: they
+/// survive LOG-FREEZE, which kills queue-path log writes but not process
+/// state, so WARN-absence stays non-evidence on frozen seats while the
+/// counter keeps the truth for the status producer (B6b) to POST later.
+/// (0.5.23 port: the gate decision itself now lives in
+/// InboundAuthorGate::authorize_listener_event.)
+static GATE_DROPS_OWNER_ONLY: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
+static GATE_DROPS_ALLOWLIST: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
+static GATE_DROPS_ANYONE: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
+static GATE_DROPS_NOBODY: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
+
 /// Return the workflow owner attributed by a relay-signed workflow message.
 ///
 /// `buzz:workflow-owner` alone is not authority: any ordinary event author can
@@ -339,6 +350,9 @@ mod inbound_author_gate {
     use super::{
         effective_prompt_author, is_dm_channel, is_owner_or_sibling, pool, refresh_relay_self,
         relay, OwnerCache, RespondTo,
+    };
+    use crate::{
+        GATE_DROPS_ALLOWLIST, GATE_DROPS_ANYONE, GATE_DROPS_NOBODY, GATE_DROPS_OWNER_ONLY,
     };
     use std::collections::HashSet;
 
@@ -542,16 +556,36 @@ mod inbound_author_gate {
                 )
                 .await;
             if !decision.allowed {
-                tracing::debug!(
+                // A6 port (0.5.23): WARN + event_id + per-mode freeze-surviving
+                // counters, upgraded from upstream's debug!-level drop log so
+                // gate drops stay attributable on running seats.
+                let drops_total = match respond_to {
+                    RespondTo::OwnerOnly => &GATE_DROPS_OWNER_ONLY,
+                    RespondTo::Allowlist => &GATE_DROPS_ALLOWLIST,
+                    RespondTo::Anyone => &GATE_DROPS_ANYONE,
+                    RespondTo::Nobody => &GATE_DROPS_NOBODY,
+                }
+                .fetch_add(1, std::sync::atomic::Ordering::Relaxed)
+                    + 1;
+                tracing::warn!(
+                    event_id = %buzz_event.event.id,
                     channel_id = %buzz_event.channel_id,
                     raw_author = %buzz_event.event.pubkey.to_hex(),
                     effective_author = %decision.effective_author,
                     mode = %respond_to,
                     is_dm = decision.is_dm,
+                    drops_total,
                     "inbound author gate — dropping event"
                 );
                 return None;
             }
+            tracing::info!(
+                event_id = %buzz_event.event.id,
+                channel_id = %buzz_event.channel_id,
+                effective_author = %decision.effective_author,
+                is_dm = decision.is_dm,
+                "intake receipt — event admitted to dispatch"
+            );
             Some(AuthorizedListenerEvent {
                 buzz_event,
                 effective_author: decision.effective_author,
@@ -4503,6 +4537,23 @@ fn dispatch_pending(
             }
         };
         tracing::debug!(agent = agent.index, channel = %channel_id, scope = %scope.telemetry_label(), affinity_hit, "agent_claimed");
+        tracing::info!(
+            channel_id = %channel_id,
+            event_count = batch.events.len(),
+            event_ids = %batch
+                .events
+                .iter()
+                .map(|e| e.event.id.to_string())
+                .collect::<Vec<_>>()
+                .join(","),
+            oldest_wait_ms = batch
+                .events
+                .iter()
+                .map(|e| e.received_at.elapsed().as_millis())
+                .max()
+                .unwrap_or(0),
+            "turn receipt — batch dispatched to agent"
+        );
 
         let recoverable_batch = match ctx.dedup_mode {
             DedupMode::Queue => Some(batch.clone()),
