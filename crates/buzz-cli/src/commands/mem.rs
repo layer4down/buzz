@@ -350,11 +350,13 @@ pub async fn cmd_set(
     };
     let owner = resolve_owner(client, owner_flag)?;
     let body = if slug == engram::CORE_SLUG {
-        Body::Core { profile: value }
+        Body::Core {
+            profile: value.clone(),
+        }
     } else {
         Body::Memory {
             slug: slug.clone(),
-            value: Some(value),
+            value: Some(value.clone()),
         }
     };
     let agent_pubkey = client.keys().public_key();
@@ -368,6 +370,7 @@ pub async fn cmd_set(
     let id = event.id.to_hex();
     submit_engram(client, event).await?;
     eprintln!("wrote {slug} (event {id}, created_at {created_at})");
+    verify_write(client, &agent_pubkey, &owner, &slug, Some(&value)).await?;
     Ok(())
 }
 
@@ -378,6 +381,94 @@ fn sha256_hex(s: &str) -> String {
     let mut h = Sha256::new();
     h.update(s.as_bytes());
     hex::encode(h.finalize())
+}
+
+/// Outcome of comparing a submitted write against the refetched value.
+#[derive(Debug, PartialEq, Eq, Clone, Copy)]
+enum RoundTrip {
+    /// The relay serves back exactly what we submitted — or, for a tombstone,
+    /// confirms absence. The write is durable.
+    Verified,
+    /// The relay answered, but with something other than what we submitted.
+    Mismatch,
+    /// We submitted a value but the relay serves none for the slug.
+    Absent,
+}
+
+/// Pure decision core of A1 write-verify: `expected` is the value we just
+/// submitted (`None` = we tombstoned the slug); `fetched` is the refetch
+/// outcome (`Err(())` = NotFound of any kind: absent or tombstoned).
+fn classify_round_trip(expected: Option<&str>, fetched: Result<&str, ()>) -> RoundTrip {
+    match (expected, fetched) {
+        (Some(exp), Ok(got)) => {
+            if sha256_hex(exp) == sha256_hex(got) {
+                RoundTrip::Verified
+            } else {
+                RoundTrip::Mismatch
+            }
+        }
+        (Some(_), Err(())) => RoundTrip::Absent,
+        // A tombstone is confirmed by any NotFound shape.
+        (None, Err(())) => RoundTrip::Verified,
+        (None, Ok(_)) => RoundTrip::Mismatch,
+    }
+}
+
+/// A1 (MEM-FREEZE) write-verify: after a write, refetch the slug and confirm
+/// the relay serves back exactly what was submitted (hashed round-trip), so
+/// write-loss — submit acknowledged but the value not durable — becomes a
+/// loud non-zero exit instead of silent drift. One bounded retry absorbs
+/// read-your-write lag; a persistent mismatch fails the command.
+async fn verify_write(
+    client: &BuzzClient,
+    agent: &PublicKey,
+    owner: &PublicKey,
+    slug: &str,
+    expected: Option<&str>,
+) -> Result<(), CliError> {
+    const VERIFY_RETRY_DELAY: std::time::Duration = std::time::Duration::from_millis(750);
+    let mut last: Option<RoundTrip> = None;
+    for attempt in 0..2 {
+        if attempt > 0 {
+            tokio::time::sleep(VERIFY_RETRY_DELAY).await;
+        }
+        let outcome = match fetch_value(client, agent, owner, slug).await {
+            Ok((_, value)) => classify_round_trip(expected, Ok(value.as_str())),
+            Err(CliError::NotFound(_)) => classify_round_trip(expected, Err(())),
+            // Transport-level refetch failure: retry once (transient), then
+            // surface as indeterminate rather than guessed.
+            Err(e) => {
+                if attempt == 0 {
+                    continue;
+                }
+                return Err(CliError::Other(format!(
+                    "WRITE-VERIFY INDETERMINATE for {slug}: refetch failed after retry: {e} — \
+                     the write may or may not have landed; re-run the command"
+                )));
+            }
+        };
+        if outcome == RoundTrip::Verified {
+            match expected {
+                Some(value) => eprintln!(
+                    "verified {slug} round-trip (sha256 {}…)",
+                    &sha256_hex(value)[..12]
+                ),
+                None => eprintln!("verified {slug} round-trip (tombstone confirmed)"),
+            }
+            return Ok(());
+        }
+        last = Some(outcome);
+    }
+    Err(CliError::Other(format!(
+        "WRITE-VERIFY FAILED for {slug}: after retry the relay {} — treat the write as LOST; \
+         re-run the command before relying on the stored value",
+        match last {
+            Some(RoundTrip::Mismatch) =>
+                "serves a value that differs from what was submitted".to_string(),
+            Some(RoundTrip::Absent) => "serves no value for the slug".to_string(),
+            _ => "did not confirm the write".to_string(),
+        }
+    )))
 }
 
 /// Verify that each hunk's preimage lines (Context + Delete) match the
@@ -694,6 +785,14 @@ pub async fn cmd_patch(
     let id = event.id.to_hex();
     submit_engram(client, event).await?;
     eprintln!("wrote {slug} (event {id}, created_at {created_at}, sha256 {new_hash})");
+    verify_write(
+        client,
+        &client.keys().public_key(),
+        &owner,
+        &slug,
+        Some(&new_value),
+    )
+    .await?;
     Ok(())
 }
 
@@ -731,6 +830,7 @@ pub async fn cmd_rm(
     let id = event.id.to_hex();
     submit_engram(client, event).await?;
     eprintln!("tombstoned {slug} (event {id}, created_at {created_at})");
+    verify_write(client, &agent_pubkey, &owner, &slug, None).await?;
     Ok(())
 }
 
@@ -857,6 +957,42 @@ mod tests {
             sha256_hex("abc"),
             "ba7816bf8f01cfea414140de5dae2223b00361a396177a9cb410ff61f20015ad"
         );
+    }
+
+    #[test]
+    fn classify_round_trip_value_match() {
+        assert_eq!(
+            classify_round_trip(Some("abc"), Ok("abc")),
+            RoundTrip::Verified
+        );
+        // Byte-exact comparison, not prefix.
+        assert_eq!(
+            classify_round_trip(Some("abc"), Ok("abcd")),
+            RoundTrip::Mismatch
+        );
+        // Empty values round-trip as themselves (set core '' --allow-empty).
+        assert_eq!(classify_round_trip(Some(""), Ok("")), RoundTrip::Verified);
+    }
+
+    #[test]
+    fn classify_round_trip_value_mismatch() {
+        assert_eq!(
+            classify_round_trip(Some("abc"), Ok("abd")),
+            RoundTrip::Mismatch
+        );
+    }
+
+    #[test]
+    fn classify_round_trip_expected_but_absent() {
+        assert_eq!(classify_round_trip(Some("abc"), Err(())), RoundTrip::Absent);
+    }
+
+    #[test]
+    fn classify_round_trip_tombstone_confirmed() {
+        // rm writes a tombstone; any NotFound shape confirms it.
+        assert_eq!(classify_round_trip(None, Err(())), RoundTrip::Verified);
+        // A value still served after rm means the tombstone did not land.
+        assert_eq!(classify_round_trip(None, Ok("stale")), RoundTrip::Mismatch);
     }
 
     #[test]

@@ -128,9 +128,18 @@ pub struct SessionState {
     pub heartbeat_turn_count: u32,
     /// Whether the live heartbeat session has successfully received `<base>`.
     pub heartbeat_standing_context_sent: bool,
-    /// session scope → rendered NIP-AE core prompt section, populated once at
-    /// session creation per Tyler's spec (no mid-session refresh).
+    /// session scope → rendered NIP-AE core prompt section. Refreshed from
+    /// the relay on every channel turn (A1 / MEM-FREEZE — supersedes the
+    /// populate-once spec); the spawn-time fetch seeds it for a new scope,
+    /// and it doubles as the last-known-good fallback when a refresh fails
+    /// or times out. Cleared on session invalidation.
     pub core_sections: HashMap<SessionScope, String>,
+    /// session scope → the core section baked into the live session's system
+    /// role at session creation. Per-turn refresh compares against this to
+    /// detect drift (modern agents cannot mutate the system role
+    /// mid-session, so a changed core is delivered as a user-message delta
+    /// instead). Mirrors `core_sections`' invalidation lifecycle.
+    pub baked_core_sections: HashMap<SessionScope, String>,
     /// session scope → rendered `<channel-canvas>` metadata section.
     ///
     /// Populated once before session creation (same lifecycle as `core_sections`).
@@ -163,6 +172,7 @@ impl SessionState {
     pub fn invalidate_scope(&mut self, scope: &SessionScope) -> bool {
         self.turn_counts.remove(scope);
         self.core_sections.remove(scope);
+        self.baked_core_sections.remove(scope);
         self.canvas_sections.remove(scope);
         self.deliveries.remove(scope);
         self.sessions.remove(scope).is_some()
@@ -177,6 +187,7 @@ impl SessionState {
             .keys()
             .chain(self.turn_counts.keys())
             .chain(self.core_sections.keys())
+            .chain(self.baked_core_sections.keys())
             .chain(self.canvas_sections.keys())
             .chain(self.deliveries.keys())
             .filter(|s| s.channel_id() == *channel_id)
@@ -201,6 +212,7 @@ impl SessionState {
         self.heartbeat_turn_count = 0;
         self.heartbeat_standing_context_sent = false;
         self.core_sections.clear();
+        self.baked_core_sections.clear();
         self.canvas_sections.clear();
         self.deliveries.clear();
     }
@@ -222,8 +234,76 @@ impl SessionState {
         self.sessions.keys().any(matches)
             || self.turn_counts.keys().any(matches)
             || self.core_sections.keys().any(matches)
+            || self.baked_core_sections.keys().any(matches)
             || self.canvas_sections.keys().any(matches)
             || self.deliveries.keys().any(matches)
+    }
+}
+
+/// Pure decision core of the A1 drift check (extracted so the refresh logic
+/// has a deterministic mutation probe): given the freshly refreshed core
+/// section and the section the live session's system role baked in at
+/// session/new, decide the user-message delta for a modern agent.
+/// `None` when unchanged (no duplication), on the session's first turn (the
+/// system role just received the fresh value), or when no fresh section
+/// exists (refresh failed with an empty cache). A missing baked entry
+/// (session created before drift detection existed) yields the delta until
+/// rotation recreates the session — current truth, bounded by the rotation
+/// policy.
+pub(crate) fn core_delta_for_turn<'a>(
+    fresh: Option<&'a str>,
+    baked: Option<&'a str>,
+    is_new_session: bool,
+) -> Option<&'a str> {
+    if is_new_session {
+        return None;
+    }
+    match (fresh, baked) {
+        (Some(f), Some(b)) if f == b => None,
+        (Some(f), _) => Some(f),
+        (None, _) => None,
+    }
+}
+
+/// What the per-turn core refresh should do, decoupled from the relay
+/// client so every arm is unit-testable (`CoreFetch` is a plain enum —
+/// no client involved).
+#[derive(Debug, PartialEq, Eq, Clone)]
+pub(crate) enum RefreshOutcome {
+    /// A verified, decryptable core exists: serve it and replace the cache.
+    Replace { section: String },
+    /// Fetch unavailable (error/timeout) or confirmed absence with a
+    /// populated cache: serve last-known-good, leave the cache untouched.
+    /// `None` = nothing cached and nothing verified → serve no section
+    /// (spawn fail-open semantics).
+    Retain { section: Option<String> },
+    /// Confirmed absence with a genuinely empty cache: serve and cache the
+    /// onboarding nudge (spawn-equivalent bootstrap).
+    Bootstrap { nudge: String },
+}
+
+/// Pure decision core of the A1 per-turn refresh — the four safety arms the
+/// review bar requires pinned, exactly what would have caught the push-1
+/// absence/nudge miss:
+/// - `Section` → Replace: a populated cache is only ever replaced by a
+///   verified core.
+/// - `Failed` (incl. normalized timeout) → Retain(LKG).
+/// - `Absent` + populated → Retain(LKG, *not* the nudge).
+/// - `Absent` + empty → Bootstrap(nudge).
+pub(crate) fn refresh_outcome(
+    fetch: crate::engram_fetch::CoreFetch,
+    cached: Option<String>,
+) -> RefreshOutcome {
+    use crate::engram_fetch::CoreFetch;
+    match fetch {
+        CoreFetch::Section(section) => RefreshOutcome::Replace { section },
+        CoreFetch::Failed(_) => RefreshOutcome::Retain { section: cached },
+        CoreFetch::Absent => match cached {
+            Some(lkg) => RefreshOutcome::Retain { section: Some(lkg) },
+            None => RefreshOutcome::Bootstrap {
+                nudge: crate::engram_fetch::nudge_section(),
+            },
+        },
     }
 }
 
@@ -2249,9 +2329,10 @@ pub async fn run_prompt_task(
     //     the agent to overwrite real, just-unreachable memory.
     //   * fetch exceeds CORE_FETCH_TIMEOUT → inject nothing, same reason.
     //
-    // Per Tyler's locked spec: NO mid-session refreshes. Re-fetch only
-    // happens when a session is invalidated and recreated (see
-    // `SessionState::invalidate_channel`).
+    // A1 (MEM-FREEZE): the locked no-mid-session-refresh rule is retired —
+    // every channel turn now re-fetches the core (see the refresh at the
+    // `agent_core` binding below). This spawn-time fetch still seeds the
+    // cache for a new channel's first turn and for session recreation.
     //
     // Operator opt-out: `--no-memory` / `BUZZ_ACP_NO_MEMORY` skips the fetch.
     if ctx.memory_enabled {
@@ -2341,8 +2422,106 @@ pub async fn run_prompt_task(
 
     // The core section to fold into the system prompt for this turn's session.
     // Channel-scoped; heartbeats carry no owner core.
+    //
+    // A1 (MEM-FREEZE): re-fetched from the relay on EVERY channel turn so
+    // long-lived sessions stop acting on the spawn snapshot. The cached
+    // value is only the last-known-good fallback for refresh failures —
+    // never a reason to block the turn (bounded by the same 3s budget the
+    // spawn-time fetch uses).
     let agent_core: Option<String> = match &source {
-        PromptSource::Channel(scope) => agent.state.core_sections.get(scope).cloned(),
+        PromptSource::Channel(scope) => {
+            let cid = &scope.channel_id();
+            if let (true, Some(owner_pk)) = (ctx.memory_enabled, ctx.agent_owner_pubkey.as_ref()) {
+                const CORE_REFRESH_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(3);
+                let cached = agent.state.core_sections.get(scope).cloned();
+                let fetch = crate::engram_fetch::fetch_core_section(
+                    &ctx.rest_client,
+                    &ctx.agent_keys,
+                    owner_pk,
+                );
+                // Normalize the timeout to `Failed` so every unavailable-fetch
+                // path flows through the same unit-tested decision
+                // (`refresh_outcome`); the per-reason counters and WARNs stay
+                // here where the distinction is known.
+                let fetch = match tokio::time::timeout(CORE_REFRESH_TIMEOUT, fetch).await {
+                    Ok(crate::engram_fetch::CoreFetch::Failed(reason)) => {
+                        tracing::warn!(
+                            target: "engram::core",
+                            channel = %cid,
+                            refresh_failed_total = crate::engram_fetch::note_refresh_failed(),
+                            "core refresh failed: {reason} — using last-known-good"
+                        );
+                        crate::engram_fetch::CoreFetch::Failed(reason)
+                    }
+                    Ok(f) => f,
+                    Err(_) => {
+                        tracing::warn!(
+                            target: "engram::core",
+                            channel = %cid,
+                            timeout_ms = CORE_REFRESH_TIMEOUT.as_millis() as u64,
+                            refresh_timeout_total = crate::engram_fetch::note_refresh_timeout(),
+                            "core refresh timed out — using last-known-good"
+                        );
+                        crate::engram_fetch::CoreFetch::Failed("refresh timed out".to_string())
+                    }
+                };
+                let is_absent = matches!(fetch, crate::engram_fetch::CoreFetch::Absent);
+                match refresh_outcome(fetch, cached) {
+                    RefreshOutcome::Replace { section } => {
+                        tracing::info!(
+                            target: "engram::core",
+                            channel = %cid,
+                            core_sha = %crate::engram_fetch::core_hash12(
+                                crate::engram_fetch::section_profile(&section)
+                            ),
+                            "core refresh — fresh section cached"
+                        );
+                        agent.state.core_sections.insert(scope.clone(), section.clone());
+                        Some(section)
+                    }
+                    RefreshOutcome::Retain { section } => {
+                        // Failure or confirmed-absence-with-populated-cache:
+                        // last-known-good served, cache untouched. A populated
+                        // cache is replaced ONLY by a verified, decryptable
+                        // core — `rm core` is refused at the CLI, so
+                        // mid-session absence is not trusted to strip a
+                        // running session's core block (swapping in the
+                        // onboarding nudge would invite exactly the overwrite
+                        // disaster the fail-closed spawn semantics exist to
+                        // prevent).
+                        if is_absent {
+                            tracing::warn!(
+                                target: "engram::core",
+                                channel = %cid,
+                                absent_lkg_total =
+                                    crate::engram_fetch::note_refresh_absent_lkg(),
+                                kept_lkg = section.is_some(),
+                                "core refresh: relay confirms no core — \
+                                 keeping last-known-good mid-session"
+                            );
+                        }
+                        section
+                    }
+                    RefreshOutcome::Bootstrap { nudge } => {
+                        // Confirmed absence with a genuinely empty cache —
+                        // spawn-equivalent: the nudge teaches bootstrap.
+                        tracing::warn!(
+                            target: "engram::core",
+                            channel = %cid,
+                            absent_lkg_total =
+                                crate::engram_fetch::note_refresh_absent_lkg(),
+                            kept_lkg = false,
+                            "core refresh: no core and empty cache — \
+                             caching onboarding nudge"
+                        );
+                        agent.state.core_sections.insert(scope.clone(), nudge.clone());
+                        Some(nudge)
+                    }
+                }
+            } else {
+                agent.state.core_sections.get(scope).cloned()
+            }
+        }
         PromptSource::Heartbeat => None,
     };
 
@@ -2395,6 +2574,20 @@ pub async fn run_prompt_task(
                         // Seed a zero usage baseline: buzz-acp spawned this session
                         // so prior usage is zero by definition — first turn is reliable.
                         agent.acp.notify_session_spawned(&sid);
+                        // A1: remember what this session's system role just
+                        // baked in, so per-turn refresh can detect later drift
+                        // (see the `agent_core_delta` binding below).
+                        match agent_core.as_deref() {
+                            Some(core) => {
+                                agent
+                                    .state
+                                    .baked_core_sections
+                                    .insert(scope.clone(), core.to_string());
+                            }
+                            None => {
+                                agent.state.baked_core_sections.remove(scope);
+                            }
+                        }
                         // Commit canvas only after session creation succeeds (I3).
                         if let Some((pending_scope, section)) = pending_canvas.take() {
                             agent.state.canvas_sections.insert(pending_scope, section);
@@ -2484,6 +2677,26 @@ pub async fn run_prompt_task(
                 }
             }
         }
+    };
+    // A1 delta path: modern agents bake their core into the system role at
+    // session/new and it cannot be mutated mid-session. When the per-turn
+    // refresh above produced a section that differs from what the live
+    // session baked in, deliver the fresh section as a user-message section
+    // on this turn so the session acts on current memory (decision logic in
+    // `core_delta_for_turn`, unit-tested). Legacy agents receive the
+    // refreshed section every turn instead, so no delta applies.
+    let agent_core_delta: Option<String> = if agent.has_system_prompt_support() {
+        match &source {
+            PromptSource::Channel(cid) => core_delta_for_turn(
+                agent_core.as_deref(),
+                agent.state.baked_core_sections.get(cid).map(String::as_str),
+                is_new_session,
+            )
+            .map(str::to_string),
+            PromptSource::Heartbeat => None,
+        }
+    } else {
+        None
     };
     agent.acp.set_observer_context(observer::context_for_turn(
         observer_channel_id,
@@ -2778,6 +2991,7 @@ pub async fn run_prompt_task(
             &crate::queue::FormatPromptArgs {
                 agent_core: standing.agent_core,
                 huddle_instructions: standing.huddle_instructions,
+                agent_core_delta: agent_core_delta.as_deref(),
                 channel_info: channel_info.as_ref(),
                 conversation_context: conversation_context.as_ref(),
                 conversation_context_had_delivered_events,
@@ -7210,6 +7424,132 @@ printf '%s\n' '{{"jsonrpc":"2.0","id":0,"result":{{"stopReason":"end_turn"}}}}'"
     fn test_pct_encode_hex_passthrough() {
         let hex = "a1b2c3d4e5f6a1b2c3d4e5f6a1b2c3d4e5f6a1b2c3d4e5f6a1b2c3d4e5f6a1b2";
         assert_eq!(pct_encode(hex), hex);
+    }
+
+    #[test]
+    fn invalidate_clears_baked_core_alongside_core_sections() {
+        // A1: the baked-core drift baseline must mirror core_sections'
+        // invalidation lifecycle, or stale drift detection survives a
+        // session invalidation.
+        let mut s = SessionState::default();
+        let ch = Uuid::new_v4();
+        s.sessions.insert(ch, "s1".into());
+        s.core_sections.insert(ch, "core-a".into());
+        s.baked_core_sections.insert(ch, "core-a".into());
+        assert!(s.has_channel_state(&ch));
+        assert!(s.invalidate_channel(&ch));
+        assert!(!s.has_channel_state(&ch));
+        assert!(!s.baked_core_sections.contains_key(&ch));
+        assert!(!s.core_sections.contains_key(&ch));
+
+        s.baked_core_sections.insert(ch, "stale-baseline".into());
+        s.invalidate_all();
+        assert!(s.baked_core_sections.is_empty());
+    }
+
+    #[test]
+    fn core_delta_for_turn_changed_core_yields_delta() {
+        // The A1 mutation probe: if the drift comparison is removed (always
+        // None), this fails; if dedup is removed (always Some), the
+        // unchanged case below fails.
+        assert_eq!(
+            core_delta_for_turn(Some("v2"), Some("v1"), false),
+            Some("v2")
+        );
+    }
+
+    #[test]
+    fn core_delta_for_turn_unchanged_core_suppressed() {
+        assert_eq!(
+            core_delta_for_turn(Some("v1"), Some("v1"), false),
+            None,
+            "unchanged core must not duplicate the system role"
+        );
+    }
+
+    #[test]
+    fn core_delta_for_turn_missing_baked_entry_yields_delta() {
+        // Pre-existing sessions (created before drift detection) have no
+        // baked entry — deliver current truth until rotation bakes it.
+        assert_eq!(core_delta_for_turn(Some("v1"), None, false), Some("v1"));
+    }
+
+    #[test]
+    fn core_delta_for_turn_first_turn_and_no_fresh_suppressed() {
+        // The session-creation turn baked the fresh value already.
+        assert_eq!(core_delta_for_turn(Some("v2"), Some("v1"), true), None);
+        // Refresh failed with an empty cache — nothing to deliver.
+        assert_eq!(core_delta_for_turn(None, Some("v1"), false), None);
+        assert_eq!(core_delta_for_turn(None, None, false), None);
+    }
+
+    /// The four refresh safety arms (review bar): the exact tests that
+    /// would have caught the push-1 absence/nudge miss. Mutation probes:
+    /// swap any arm's mapping and exactly one of these fails.
+    #[test]
+    fn refresh_outcome_failed_retains_last_known_good() {
+        assert_eq!(
+            refresh_outcome(
+                crate::engram_fetch::CoreFetch::Failed("relay down".into()),
+                Some("lkg".into()),
+            ),
+            RefreshOutcome::Retain {
+                section: Some("lkg".into())
+            }
+        );
+        // Failed with an empty cache serves nothing (fail-open spawn
+        // semantics) — never a nudge, never a guess.
+        assert_eq!(
+            refresh_outcome(
+                crate::engram_fetch::CoreFetch::Failed("relay down".into()),
+                None,
+            ),
+            RefreshOutcome::Retain { section: None }
+        );
+    }
+
+    #[test]
+    fn refresh_outcome_absent_populated_retains_lkg_not_nudge() {
+        // The push-1 bug: absence must NOT swap a populated cache for the
+        // onboarding nudge.
+        let out = refresh_outcome(crate::engram_fetch::CoreFetch::Absent, Some("lkg".into()));
+        assert_eq!(
+            out,
+            RefreshOutcome::Retain {
+                section: Some("lkg".into())
+            }
+        );
+    }
+
+    #[test]
+    fn refresh_outcome_absent_empty_bootstraps_nudge() {
+        match refresh_outcome(crate::engram_fetch::CoreFetch::Absent, None) {
+            RefreshOutcome::Bootstrap { nudge } => {
+                assert!(nudge.starts_with("[Agent Memory — core]\n"));
+                assert!(nudge.contains("No core memory found"));
+            }
+            other => panic!("expected Bootstrap, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn refresh_outcome_section_replaces_cache() {
+        assert_eq!(
+            refresh_outcome(
+                crate::engram_fetch::CoreFetch::Section("v2".into()),
+                Some("v1".into()),
+            ),
+            RefreshOutcome::Replace {
+                section: "v2".into()
+            }
+        );
+        // Also fills an empty cache (first verified fetch mid-session).
+        assert_eq!(
+            refresh_outcome(crate::engram_fetch::CoreFetch::Section("v1".into()), None,),
+            RefreshOutcome::Replace {
+                section: "v1".into()
+            }
+        );
     }
 
     #[test]

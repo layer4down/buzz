@@ -1841,6 +1841,12 @@ pub struct FormatPromptArgs<'a> {
     pub agent_core: Option<&'a str>,
     /// Owner-signed instructions for an active huddle channel.
     pub huddle_instructions: Option<&'a str>,
+    /// Fresh core section that differs from what the live session's system
+    /// role baked in at session/new (A1 / MEM-FREEZE delta path). Modern
+    /// agents only — delivered as a user-message section because the system
+    /// role cannot be mutated mid-session. `None` means the baked core is
+    /// still current (no duplication with the system role).
+    pub agent_core_delta: Option<&'a str>,
     pub channel_info: Option<&'a PromptChannelInfo>,
     pub conversation_context: Option<&'a ConversationContext>,
     /// True when delivery-delta filtering removed at least one event that this
@@ -2009,6 +2015,18 @@ pub fn format_prompt(batch: &FlushBatch, args: &FormatPromptArgs<'_>) -> Vec<Str
             }
             .sections(),
         );
+    } else if args.has_system_prompt_support {
+        // A1 (MEM-FREEZE) port onto standing-context delivery: modern agents
+        // bake their core into the system role at session/new and it cannot
+        // be mutated mid-session. When the per-turn refresh finds a changed
+        // core, deliver the fresh section here as a user-message section so
+        // the session acts on current memory instead of the spawn snapshot.
+        // Suppressed when unchanged to avoid duplication. (Legacy agents
+        // after standing-sent ride the upstream once-per-session model; the
+        // A1 refresh still updates their cache for the next session spawn.)
+        if let Some(delta) = args.agent_core_delta {
+            sections.push(delta.to_string());
+        }
     }
 
     // 2. Context hints (with a human-aware reply anchor).
@@ -3100,6 +3118,79 @@ mod tests {
             "modern agents must not get core in the user message; got: {prompt}"
         );
         assert!(prompt.starts_with("<context>"));
+    }
+
+    #[test]
+    fn test_format_prompt_modern_agent_receives_core_delta() {
+        // A1 (MEM-FREEZE) delta path: when the per-turn refresh finds a core
+        // that differs from what the live session's system role baked in at
+        // session/new, the fresh section rides the user message — the system
+        // role cannot be mutated mid-session.
+        let ch = Uuid::new_v4();
+        let event = make_event("hi");
+        let batch = FlushBatch {
+            channel_id: ch,
+            events: vec![BatchEvent {
+                event,
+                prompt_tag: "test".into(),
+                received_at: Instant::now(),
+            }],
+            cancelled_events: vec![],
+            cancel_reason: None,
+        };
+        let prompt = format_prompt(
+            &batch,
+            &FormatPromptArgs {
+                agent_core_delta: Some("[Agent Memory — core]\nbe v2"),
+                has_system_prompt_support: true,
+                ..Default::default()
+            },
+        )
+        .join("\n\n");
+        assert!(
+            prompt.contains("[Agent Memory — core]\nbe v2"),
+            "changed core must reach the modern agent's user message; got: {prompt}"
+        );
+        let core_pos = prompt
+            .find("[Agent Memory")
+            .expect("[Agent Memory] missing");
+        let context_pos = prompt.find("[Context]").expect("[Context] missing");
+        assert!(
+            core_pos < context_pos,
+            "delta core section must precede [Context]"
+        );
+    }
+
+    #[test]
+    fn test_format_prompt_modern_agent_delta_none_omits_section() {
+        // Unchanged core → delta None → no core section in the user message.
+        // Pins the suppression rule separately from the agent_core-set case
+        // in test_format_prompt_modern_agent_omits_core_from_user_message.
+        let ch = Uuid::new_v4();
+        let event = make_event("hi");
+        let batch = FlushBatch {
+            channel_id: ch,
+            events: vec![BatchEvent {
+                event,
+                prompt_tag: "test".into(),
+                received_at: Instant::now(),
+            }],
+            cancelled_events: vec![],
+            cancel_reason: None,
+        };
+        let prompt = format_prompt(
+            &batch,
+            &FormatPromptArgs {
+                has_system_prompt_support: true,
+                ..Default::default()
+            },
+        )
+        .join("\n\n");
+        assert!(
+            !prompt.contains("[Agent Memory"),
+            "no delta means no core section in the user message; got: {prompt}"
+        );
+        assert!(prompt.starts_with("[Context]"));
     }
 
     #[test]
