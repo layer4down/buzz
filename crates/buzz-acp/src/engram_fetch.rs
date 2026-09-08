@@ -14,6 +14,8 @@
 use buzz_core::engram::{conversation_key, d_tag, select_head, validate_and_decrypt, Body};
 use buzz_core::kind::KIND_AGENT_ENGRAM;
 use nostr::{Event, Keys, PublicKey};
+use sha2::{Digest, Sha256};
+use std::sync::atomic::{AtomicU64, Ordering};
 
 use crate::relay::RestClient;
 
@@ -41,10 +43,10 @@ pub async fn build_core_section(
     agent_keys: &Keys,
     owner: &PublicKey,
 ) -> Option<String> {
-    match fetch_core_body(rest, agent_keys, owner).await {
-        Ok(Some(profile)) => Some(format!("[{SECTION_LABEL}]\n{profile}")),
-        Ok(None) => Some(format!("[{SECTION_LABEL}]\n{ONBOARDING_NUDGE}")),
-        Err(reason) => {
+    match fetch_core_section(rest, agent_keys, owner).await {
+        CoreFetch::Section(section) => Some(section),
+        CoreFetch::Absent => Some(nudge_section()),
+        CoreFetch::Failed(reason) => {
             tracing::warn!(
                 target: "engram::core",
                 "core fetch failed: {reason} — emitting no section to avoid \
@@ -53,6 +55,85 @@ pub async fn build_core_section(
             None
         }
     }
+}
+
+/// Outcome of a core-head fetch. The spawn-time path and the A1 per-turn
+/// refresh path treat these three states differently, so they must not be
+/// collapsed into one:
+/// - `Section` — a verified, decryptable core exists (rendered).
+/// - `Absent` — the relay *confirmed* no core exists. At spawn this renders
+///   the onboarding nudge; mid-session the refresh keeps last-known-good
+///   instead (a populated cache is only ever replaced by a verified core).
+/// - `Failed` — transport / decrypt / parse error. Spawn emits nothing;
+///   refresh keeps last-known-good.
+pub enum CoreFetch {
+    Section(String),
+    Absent,
+    Failed(String),
+}
+
+/// Monotonic per-reason refresh-failure counters (the PR-1 `drops_total`
+/// discipline): a silently-failing refresh is MEM-FREEZE rebuilt via the
+/// network route, and WARN lines ride the freeze-prone log queue — the
+/// counter survives where the log line may not. In-memory by design
+/// (reset-on-bounce bounded by B6b's POST cadence, same accepted gap as
+/// the gate drop counters).
+static REFRESH_FAILED_TOTAL: AtomicU64 = AtomicU64::new(0);
+static REFRESH_TIMEOUT_TOTAL: AtomicU64 = AtomicU64::new(0);
+static REFRESH_ABSENT_LKG_TOTAL: AtomicU64 = AtomicU64::new(0);
+
+/// Count a refresh that errored (transport/decrypt/parse); returns the
+/// post-increment value for the WARN line.
+pub(crate) fn note_refresh_failed() -> u64 {
+    REFRESH_FAILED_TOTAL.fetch_add(1, Ordering::Relaxed) + 1
+}
+
+/// Count a refresh that exceeded its timeout budget.
+pub(crate) fn note_refresh_timeout() -> u64 {
+    REFRESH_TIMEOUT_TOTAL.fetch_add(1, Ordering::Relaxed) + 1
+}
+
+/// Count a mid-session confirmed absence that fell back to last-known-good.
+pub(crate) fn note_refresh_absent_lkg() -> u64 {
+    REFRESH_ABSENT_LKG_TOTAL.fetch_add(1, Ordering::Relaxed) + 1
+}
+
+/// Query, decode, and classify the core head, keeping "the relay answered
+/// with a core", "the relay confirmed absence", and "the fetch failed"
+/// distinct so each caller (spawn vs per-turn refresh) can map them to its
+/// own failure semantics.
+pub async fn fetch_core_section(
+    rest: &RestClient,
+    agent_keys: &Keys,
+    owner: &PublicKey,
+) -> CoreFetch {
+    match fetch_core_body(rest, agent_keys, owner).await {
+        Ok(Some(profile)) => CoreFetch::Section(format!("[{SECTION_LABEL}]\n{profile}")),
+        Ok(None) => CoreFetch::Absent,
+        Err(reason) => CoreFetch::Failed(reason),
+    }
+}
+
+/// Strip the rendered section header, returning the bare profile body — the
+/// string whose sha256 matches `buzz mem hash core` output.
+pub(crate) fn section_profile(section: &str) -> &str {
+    section
+        .strip_prefix(&format!("[{SECTION_LABEL}]\n"))
+        .unwrap_or(section)
+}
+
+/// Short sha256 prefix of a profile body, for per-turn refresh receipts —
+/// cross-referenceable with `buzz mem hash core` and the CLI's write-verify
+/// output (same underlying hash, truncated to 12 hex chars).
+pub(crate) fn core_hash12(profile: &str) -> String {
+    hex::encode(Sha256::digest(profile.as_bytes()))[..12].to_string()
+}
+
+/// Render the onboarding-nudge section — shared by the spawn path and the
+/// mid-session confirmed-absence case when the cache is genuinely empty, so
+/// the two can never drift apart.
+pub(crate) fn nudge_section() -> String {
+    format!("[{SECTION_LABEL}]\n{ONBOARDING_NUDGE}")
 }
 
 /// Query the relay for the core head and decode it. Returns:
@@ -168,6 +249,22 @@ mod tests {
     use super::*;
     use buzz_core::engram::{build_event, Body};
     use serde_json::json;
+
+    #[test]
+    fn section_profile_strips_rendered_header() {
+        let section = format!("[{SECTION_LABEL}]\nprofile body");
+        assert_eq!(section_profile(&section), "profile body");
+        // A string without the header passes through unchanged.
+        assert_eq!(section_profile("bare"), "bare");
+    }
+
+    #[test]
+    fn core_hash12_matches_value_sha_prefix() {
+        // Same digest as `buzz mem hash core` / the CLI's sha256_hex,
+        // truncated — the cross-reference contract for A1 receipts.
+        assert_eq!(core_hash12("abc"), "ba7816bf8f01");
+        assert_eq!(core_hash12("").len(), 12);
+    }
 
     /// Empty array → confirmed absence → Ok(None), so the caller emits the
     /// onboarding nudge. This is the only path that maps to "no core."
