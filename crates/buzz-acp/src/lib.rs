@@ -215,6 +215,15 @@ async fn is_owner_or_sibling(
     is_sibling
 }
 
+/// Monotonic per-reason gate-drop counters (A6). In-memory by design: they
+/// survive LOG-FREEZE, which kills queue-path log writes but not process
+/// state, so WARN-absence stays non-evidence on frozen seats while the
+/// counter keeps the truth for the status producer (B6b) to POST later.
+static GATE_DROPS_OWNER_ONLY: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
+static GATE_DROPS_ALLOWLIST: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
+static GATE_DROPS_ANYONE: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
+static GATE_DROPS_NOBODY: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
+
 /// Inbound author gate decision: does this author's event fire a turn?
 ///
 /// Coarse security policy applied before subscription rules. Both `OwnerOnly`
@@ -2462,15 +2471,32 @@ async fn tokio_main() -> Result<()> {
                                 )
                                 .await;
                                 if !allowed {
-                                    tracing::debug!(
+                                    let drops_total = match &config.respond_to {
+                                        RespondTo::OwnerOnly => &GATE_DROPS_OWNER_ONLY,
+                                        RespondTo::Allowlist => &GATE_DROPS_ALLOWLIST,
+                                        RespondTo::Anyone => &GATE_DROPS_ANYONE,
+                                        RespondTo::Nobody => &GATE_DROPS_NOBODY,
+                                    }
+                                    .fetch_add(1, std::sync::atomic::Ordering::Relaxed)
+                                        + 1;
+                                    tracing::warn!(
+                                        event_id = %buzz_event.event.id,
                                         channel_id = %buzz_event.channel_id,
                                         author = %buzz_event.event.pubkey.to_hex(),
                                         mode = %config.respond_to,
                                         is_dm,
+                                        drops_total,
                                         "inbound author gate — dropping event"
                                     );
                                     continue;
                                 }
+                                tracing::info!(
+                                    event_id = %buzz_event.event.id,
+                                    channel_id = %buzz_event.channel_id,
+                                    author = %author,
+                                    is_dm,
+                                    "intake receipt — event admitted to dispatch"
+                                );
                             }
 
                             let matched = filter::match_event(&buzz_event.event, buzz_event.channel_id, &rules, &pubkey_hex).await;
@@ -3267,6 +3293,23 @@ fn dispatch_pending(
             }
         };
         tracing::debug!(agent = agent.index, channel = %channel_id, affinity_hit, "agent_claimed");
+        tracing::info!(
+            channel_id = %channel_id,
+            event_count = batch.events.len(),
+            event_ids = %batch
+                .events
+                .iter()
+                .map(|e| e.event.id.to_string())
+                .collect::<Vec<_>>()
+                .join(","),
+            oldest_wait_ms = batch
+                .events
+                .iter()
+                .map(|e| e.received_at.elapsed().as_millis())
+                .max()
+                .unwrap_or(0),
+            "turn receipt — batch dispatched to agent"
+        );
 
         let recoverable_batch = match ctx.dedup_mode {
             DedupMode::Queue => Some(batch.clone()),
