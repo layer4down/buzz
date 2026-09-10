@@ -9,6 +9,7 @@ mod pool;
 mod pool_lifecycle;
 mod queue;
 mod relay;
+mod restart;
 mod self_report;
 mod setup_mode;
 mod usage;
@@ -1525,6 +1526,13 @@ mod inactivity_tests {
 }
 
 pub fn run() -> Result<()> {
+    // A4 detached-driver invocation: argv is `buzz-acp --restart-driver …`.
+    // Runs the bounded poll/respawn loop synchronously and exits — no
+    // runtime, no relay, no config (fail-soft by construction; see
+    // restart.rs and docs/a4-clean-exit-restart.md).
+    if std::env::args().nth(1).as_deref() == Some("--restart-driver") {
+        std::process::exit(restart::run_driver_from_args());
+    }
     config::propagate_legacy_env_vars();
     tokio_main()
 }
@@ -1592,6 +1600,10 @@ async fn tokio_main() -> Result<()> {
     }
 
     tracing::info!("buzz-acp starting: {}", config.summary());
+
+    // A4 boot-integration receipt: if the previous boot ended in a driver
+    // restart, log it once and consume the marker (restart.rs).
+    restart::log_boot_receipt();
 
     let observer = config
         .relay_observer
@@ -2370,6 +2382,50 @@ async fn tokio_main() -> Result<()> {
                                 // Not from owner — fall through to normal prompt handling.
                                 // Don't drop it — it's a regular message that happens to
                                 // contain "!shutdown" from a non-owner.
+                            }
+
+                            // A4 clean-exit restart (docs/a4-clean-exit-restart.md).
+                            // Mirrors !shutdown: kind:9, content "!restart", from
+                            // owner, mentions THIS agent. Ruled OWNER-ONLY v1 by PM
+                            // (2026-09-10T23:15:09Z) — same check shape as !shutdown,
+                            // no sibling-profile surface. The detached driver is
+                            // spawned BEFORE shutdown_tx fires: after the send the
+                            // in-flight drain clock runs and the executor may die
+                            // mid-turn (the 9/6 self-bounce trap). Fail-soft on every
+                            // driver arm — the clean exit proceeds regardless; a
+                            // failed respawn leaves the seat down, which is tier-1/3
+                            // (host-side) territory, never worse than !shutdown.
+                            let is_restart = is_owner_control_command(
+                                &buzz_event.event,
+                                kind_u32,
+                                "!restart",
+                                &pubkey_hex,
+                            );
+                            if is_restart {
+                                if let Some(owner) = owner_cache.get() {
+                                    if buzz_event.event.pubkey.to_hex() == *owner {
+                                        match restart::spawn_restart_driver(std::process::id()) {
+                                            Ok(true) => tracing::info!(
+                                                channel_id = %buzz_event.channel_id,
+                                                sender = %buzz_event.event.pubkey.to_hex(),
+                                                "!restart from owner — detached driver armed, initiating clean exit"
+                                            ),
+                                            Ok(false) => tracing::warn!(
+                                                channel_id = %buzz_event.channel_id,
+                                                "!restart from owner — no respawn target configured (BUZZ_ACP_LAUNCHD_LABEL / BUZZ_ACP_START_SCRIPT unset); proceeding with clean exit, seat will stay down"
+                                            ),
+                                            Err(e) => tracing::warn!(
+                                                channel_id = %buzz_event.channel_id,
+                                                error = %e,
+                                                "!restart from owner — driver spawn failed; proceeding with clean exit, seat will stay down"
+                                            ),
+                                        }
+                                        let _ = shutdown_tx.send(());
+                                        continue;
+                                    }
+                                }
+                                // Not from owner — fall through to normal prompt
+                                // handling, same as the rest of the family.
                             }
 
                             // Mirrors !shutdown: kind:9, content "!cancel", from

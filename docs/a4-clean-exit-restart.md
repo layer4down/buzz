@@ -60,9 +60,17 @@ new trigger and a driver (§4) before it. One canonical exit sequence, four trig
 Spawned BEFORE `shutdown_tx.send(())` — after the send, the drain clock is running and the
 executor may die mid-turn (the 9/6 self-bounce trap, lib.rs in-flight drain).
 
-- **Spawn**: `posix_spawn` with `POSIX_SPAWN_SETSID` (macOS has no setsid(1); this is the
-  bounce.sh perl-fork+setsid lesson moved in-binary). Driver = the daemon binary itself invoked
-  as `buzz-acp --restart-driver <target-pid> <mode> [label]`, no key material in argv, no shell.
+- **Spawn** (as implemented): std-only, no new crates — detachment is
+  `CommandExt::process_group(0)`, not a full setsid. The driver leaves the daemon's process
+  group so launchd's group-kill of the job misses it; there is no controlling tty to detach
+  from. Honest residual: a name-class kill (`killall buzz-acp`) reaches the driver (same
+  binary name) — that failure leaves the seat down, tier-1/3 territory, never worse than
+  today. Driver = the daemon binary itself invoked as
+  `buzz-acp --restart-driver <pid> --label <label|-> --script <start.sh|-> --uid <uid|->`,
+  stdio redirected to the seat's acp.log, no key material in argv, no shell.
+  Liveness via `/bin/kill -0` (std has no kill(2); one short-lived process per poll, exit
+  code only). `kill -0` succeeds on zombies — production parents reap (launchd / the script
+  daemonizer), so this is a test-harness concern only, noted in the tests.
 - **Driver behavior**: poll `kill(pid, 0)` for parent exit (bounded: drain budget 30s + 90s
   slack, then give up and log-exit — never park forever); on parent exit, respawn per mode:
   `launchd` → `launchctl kickstart gui/<uid>/<label>` (label from env `BUZZ_ACP_LAUNCHD_LABEL`
@@ -104,7 +112,7 @@ bounce.sh retired after the fleet serves A4 (runbook moves to break-glass append
 narrowed to owner-absent cases. First `!restart` use in anger = a #ops receipt with the
 boot-integration line as evidence.
 
-## 9. Open rulings (flagged per "rule early beats stall late")
+## 9. Rulings — RESOLVED by PM 2026-09-10T23:15:09Z
 
 - **R1 — author set for `!restart`**: owner-only (family precedent; rides NO profile-tag
   surface — the A6 sibling-tag class is exactly the fragile thing we should not put restart
@@ -113,8 +121,15 @@ boot-integration line as evidence.
   wants sibling reach sooner, the widening is a one-line change + tests.
 - **R2 — default state**: enabled by default (owner-gated, no config burden) vs opt-in env
   flag for a cautious first wave. Recommendation: enabled by default.
-- **R3 — retirement of tier-2 bounce.sh**: retire at fleet-serve (my rec) vs keep indefinitely
-  as documented break-glass. Either way the runbook gets an A4 section.
+- **R3 = retire bounce.sh at fleet-serve, runbook → break-glass appendix.** Scope requirement
+  adopted: the appendix explicitly OWNS the residual the in-binary path cannot reach —
+  binary DEAD (not wedged: intake not processing at all). That case stays host-side
+  launchctl/start.sh territory permanently, documented as the named break-glass trigger,
+  not a footnote. GUIDES/AGENT_SELF_BOUNCE.md gains the A4 section + the named trigger.
+
+Rider on R1, carried with the design: a widening revisit tied to tag provisioning —
+post-attestation, owner+siblings is the right end state, and the widening is a one-line
+change plus tests (the owner check in the `!restart` arm widens to the sibling set).
 
 ## 10. Out of scope
 
