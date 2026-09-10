@@ -13,6 +13,7 @@ mod prompt_project;
 mod queue;
 mod relay;
 mod scope;
+mod self_report;
 mod setup_mode;
 mod usage;
 
@@ -106,7 +107,9 @@ async fn publish_presence(
         .tags([])
         .sign_with_keys(keys)
         .map_err(|e| relay::RelayError::Http(format!("presence sign error: {e}")))?;
+    let (event_id, event_at) = (event.id.to_hex(), event.created_at.as_secs());
     publisher.publish_event(event).await?;
+    self_report::note_published(event_id, event_at);
     Ok(())
 }
 
@@ -2522,11 +2525,14 @@ async fn tokio_main() -> Result<()> {
         return run_authenticate(args).await;
     }
 
-    tracing_subscriber::fmt()
-        .with_env_filter(
-            EnvFilter::try_from_default_env().unwrap_or_else(|_| EnvFilter::new("buzz_acp=info")),
-        )
-        .compact()
+    use tracing_subscriber::prelude::*;
+    let log_counters = self_report::init_counters();
+    tracing_subscriber::registry()
+        .with(tracing_subscriber::fmt::layer().compact().with_writer(
+            self_report::CountingMakeWriter::new(log_counters.clone(), std::io::stdout),
+        ))
+        .with(self_report::EmissionCounterLayer::new(log_counters.clone()))
+        .with(EnvFilter::try_from_default_env().unwrap_or_else(|_| EnvFilter::new("buzz_acp=info")))
         .init();
 
     let mut config = Config::from_cli().map_err(|e| anyhow::anyhow!("configuration error: {e}"))?;
@@ -2639,6 +2645,7 @@ async fn tokio_main() -> Result<()> {
     }
 
     let pubkey_hex = config.keys.public_key().to_hex();
+    self_report::init_from_env(pubkey_hex.clone());
 
     // Parse BUZZ_AUTH_TAG into a nostr::Tag for NIP-OA relay membership delegation.
     let relay_auth_tag: Option<nostr::Tag> = std::env::var("BUZZ_AUTH_TAG")
@@ -3760,8 +3767,11 @@ async fn tokio_main() -> Result<()> {
                             thread_tags.root_event_id.as_deref(),
                             thread_tags.parent_event_id.as_deref(),
                         ) {
+                                let (ev_id, ev_at) = (event.id.to_hex(), event.created_at.as_secs());
                             if let Err(e) = relay.try_publish_event(event) {
                                 tracing::debug!("typing indicator dropped for {ch}: {e}");
+                            } else {
+                                    self_report::note_published(ev_id, ev_at);
                             }
                         }
                     }
@@ -3780,6 +3790,7 @@ async fn tokio_main() -> Result<()> {
                 // not the whole channel — a sibling thread still running in the
                 // same channel must keep its indicator.
                 if let Some(scope) = result.source.scope() {
+                    self_report::note_result(scope.channel_id());
                     typing_channels.remove(scope);
                 }
                 if handle_prompt_result(
@@ -4554,6 +4565,7 @@ fn dispatch_pending(
                 .unwrap_or(0),
             "turn receipt — batch dispatched to agent"
         );
+        self_report::note_dispatched(channel_id);
 
         let recoverable_batch = match ctx.dedup_mode {
             DedupMode::Queue => Some(batch.clone()),
