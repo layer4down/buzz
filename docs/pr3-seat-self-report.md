@@ -31,10 +31,20 @@ A4 (down-class restarts) consumes the same primitive later.
    (`buzz_acp::pool…` vs other). Composes into the existing
    `tracing_subscriber::fmt().with_env_filter(…).compact().init()` at lib.rs:1567.
 3. Write counting: custom `MakeWriter` wrapping the default writer; counts
-   write() invocations + bytes. HONEST LIMIT: per-target write attribution is not
-   available at this boundary (bytes only). The 9/9 discriminator still detects:
-   pool emitting + total-delta growing ⇒ pool-class loss — the module-scoped
-   repro becomes a standing production signal, not a forensics artifact.
+   write() invocations + bytes. HONEST LIMIT: per-target write attribution is
+   not available at this boundary (bytes only), so seat-side DETECTION is total
+   write-stall only (`stalled_write`: emitted advanced while written bytes did
+   not, measured report-to-report). Pool-scoped loss — the 9/9 class, pool
+   lines stalling while lib/gate lines keep landing — does NOT set the flag:
+   it is INSTRUMENTED, not detected. The payload carries per-target emission
+   counters (`log_emitted.pool` beside `log_emitted.lib`) and written lines, so
+   the pool-emitting-while-written-advances pattern is observable by
+   consumers/forensics, with disk confirmation staying post-hoc. A seat-side
+   pool-loss boolean is unsound at this boundary (bytes-only attribution;
+   multi-line events break gap-growth heuristics) and is deliberately absent —
+   revisit only with per-target write attribution or a demonstrated consumer
+   need, and then as an explicitly-heuristic field never conflated with
+   `stalled_write`.
 4. Reporter task: interval 60s + immediate flush on last-authored change;
    bounded channel with try_send (full → drop + report_drops_total++);
    POST 2s hard timeout; token from BUZZ_ACP_DASHBOARD_TOKEN validated
@@ -57,11 +67,18 @@ schema-v2 decision with Forge, not unilateral.
 body = SeatStatus JSON. Idempotent per (agent, seq). Payload capped at what the
 dashboard already renders (B6b constraint).
 
+Security note: the Bearer token travels cleartext when the URL is non-local
+`http://` — the producer validates charset, not scheme. Point
+BUZZ_ACP_DASHBOARD_URL at the tailnet `https://` front (serve 8446) or
+loopback in production; that is an operator obligation, not enforced here.
+
 ## Proof obligations (tests)
 - channel-full → drop + counter, zero awaits added to turn path
 - endpoint down → backoff sequence bounded, recovery on success
 - token charset rejection; missing URL → disabled producer, single boot log
 - freeze simulation: emission advances, writer stalls → stalled_write ≤ 2 intervals
+  (derivation-level guarantee: the flag computes on the first snapshot after
+  onset; the reporter loop's interval timing itself is tokio's and untested here)
 - mock ingest round-trip; payload size cap enforced
 
 ## Split criteria (stated per PM: don't force)

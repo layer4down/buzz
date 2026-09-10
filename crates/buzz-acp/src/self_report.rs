@@ -157,8 +157,10 @@ pub struct Latency {
 
 #[derive(Serialize, Clone, Debug, PartialEq)]
 pub struct FreezeState {
-    /// `ok` | `stalled_write` — emitted advanced while writes stalled,
-    /// measured report-to-report.
+    /// `ok` | `stalled_write` — TOTAL write-stall (emitted advanced
+    /// while written bytes did not), measured report-to-report. Pool-scoped
+    /// loss (pool lines stalling while lib/gate lines keep landing) does NOT
+    /// set this: it is instrumented in the counters, not detected here.
     pub state: &'static str,
     pub emitted_minus_written: u64,
     pub detected_at_unix: Option<u64>,
@@ -300,11 +302,22 @@ impl SelfReportState {
     }
 
     /// Freeze derivation happens report-to-report: emitted advanced while
-    /// written bytes did not ⇒ `stalled_write`.
-    pub fn snapshot(&self) -> SeatStatus {
+    /// written bytes did not ⇒ `stalled_write`. DETECTION is total-stall
+    /// only; pool-scoped loss is INSTRUMENTED (per-target counters ride the
+    /// payload), never a seat-side boolean - design doc section 3.
+    ///
+    /// Advisory path: a poisoned state lock warns and skips the report
+    /// (returns `None`) instead of killing the reporter task.
+    pub fn snapshot(&self) -> Option<SeatStatus> {
         let emitted = self.counters.snapshot();
         let written = self.counters.written();
-        let mut inner = self.inner.write().expect("self-report state lock");
+        let mut inner = match self.inner.write() {
+            Ok(guard) => guard,
+            Err(_) => {
+                tracing::warn!("self-report state lock poisoned: skipping this report");
+                return None;
+            }
+        };
         inner.seq += 1;
         let emitted_delta = emitted.total.saturating_sub(inner.prev_emitted_total);
         let written_delta = written.bytes.saturating_sub(inner.prev_written_bytes);
@@ -329,7 +342,7 @@ impl SelfReportState {
         } else {
             Some(window[window.len() / 2])
         };
-        SeatStatus {
+        Some(SeatStatus {
             agent_pubkey: inner.agent_pubkey.clone(),
             pid: inner.pid,
             boot_unix: inner.boot_unix,
@@ -345,7 +358,7 @@ impl SelfReportState {
             log_written: written,
             freeze: inner.freeze.clone(),
             report_drops_total: inner.report_drops,
-        }
+        })
     }
 }
 
@@ -470,7 +483,10 @@ pub fn init_from_env(agent_pubkey: String) {
                 }
                 backoff_until = None;
             }
-            let status = state.snapshot();
+            let Some(status) = state.snapshot() else {
+                // Poisoned state lock: warned inside snapshot(); retry next tick.
+                continue;
+            };
             match publish_once(&client, &config.url, &config.token, &status).await {
                 Ok(()) => backoff = Duration::from_secs(1),
                 Err(e) => {
@@ -546,16 +562,16 @@ mod tests {
         let counters = Arc::new(LogCounters::default());
         let state = SelfReportState::new("aa".repeat(32), counters.clone());
         // Baseline report: nothing emitted -> ok.
-        assert_eq!(state.snapshot().freeze.state, "ok");
+        assert_eq!(state.snapshot().expect("seat snapshot").freeze.state, "ok");
         // Emit without writing -> next snapshot must show stalled_write.
         counters.emitted_total.store(5, Ordering::Relaxed);
         counters.written_bytes.store(0, Ordering::Relaxed);
-        let s = state.snapshot();
+        let s = state.snapshot().expect("seat snapshot");
         assert_eq!(s.freeze.state, "stalled_write");
         assert!(s.freeze.detected_at_unix.is_some());
         // Writes resume -> recovers to ok.
         counters.written_bytes.store(4096, Ordering::Relaxed);
-        assert_eq!(state.snapshot().freeze.state, "ok");
+        assert_eq!(state.snapshot().expect("seat snapshot").freeze.state, "ok");
     }
 
     #[test]
@@ -574,7 +590,7 @@ mod tests {
     fn payload_under_cap() {
         let counters = Arc::new(LogCounters::default());
         let state = SelfReportState::new("a".repeat(64), counters.clone());
-        let status = state.snapshot();
+        let status = state.snapshot().expect("seat snapshot");
         let body = serde_json::to_vec(&status).expect("serialize");
         assert!(
             body.len() < PAYLOAD_CAP_BYTES,
@@ -583,11 +599,52 @@ mod tests {
         );
     }
 
+    #[test]
+    fn seat_status_wire_shape_pinned() {
+        // Golden pin (B6a line-format carryover): accidental field renames or
+        // reordering must fail here, not ship silently to the consumer.
+        let status = SeatStatus {
+            agent_pubkey: "ab".repeat(32),
+            pid: 4242,
+            boot_unix: 1_757_984_724,
+            seq: 42,
+            last_authored_event_id: Some("cd".repeat(32)),
+            last_authored_at_unix: Some(1_789_036_000),
+            turns_total: 7,
+            dispatch_response_latency_ms: Latency {
+                last_ms: Some(812),
+                p50_window_ms: Some(640),
+            },
+            log_emitted: EmittedCounts {
+                total: 120,
+                pool: 30,
+                lib: 90,
+            },
+            log_written: WrittenCounts {
+                lines: 100,
+                bytes: 4096,
+            },
+            freeze: FreezeState {
+                state: "stalled_write",
+                emitted_minus_written: 20,
+                detected_at_unix: Some(1_789_036_060),
+            },
+            report_drops_total: 0,
+        };
+        let json = serde_json::to_string(&status).expect("serialize");
+        let expected = format!(
+            r#"{{"agent_pubkey":"{}","pid":4242,"boot_unix":1757984724,"seq":42,"last_authored_event_id":"{}","last_authored_at_unix":1789036000,"turns_total":7,"dispatch_response_latency_ms":{{"last_ms":812,"p50_window_ms":640}},"log_emitted":{{"total":120,"pool":30,"lib":90}},"log_written":{{"lines":100,"bytes":4096}},"freeze":{{"state":"stalled_write","emitted_minus_written":20,"detected_at_unix":1789036060}},"report_drops_total":0}}"#,
+            "ab".repeat(32),
+            "cd".repeat(32)
+        );
+        assert_eq!(json, expected);
+    }
+
     #[tokio::test]
     async fn mock_ingest_round_trip_and_backoff_on_down_endpoint() {
         let counters = Arc::new(LogCounters::default());
         let state = SelfReportState::new("b".repeat(64), counters.clone());
-        let status = state.snapshot();
+        let status = state.snapshot().expect("seat snapshot");
 
         // Minimal HTTP listener on an ephemeral port.
         let listener = std::net::TcpListener::bind("127.0.0.1:0").expect("bind");
