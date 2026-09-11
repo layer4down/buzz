@@ -131,6 +131,17 @@ Rider on R1, carried with the design: a widening revisit tied to tag provisionin
 post-attestation, owner+siblings is the right end state, and the widening is a one-line
 change plus tests (the owner check in the `!restart` arm widens to the sibling set).
 
+### 4.1 Known limits (ruled doc-limit by PM 2026-09-11T01:15:08Z)
+
+**The `!restart` → `!shutdown` countermand race.** The driver polls for ANY parent
+exit in its window, so an owner `!shutdown` issued during the `!restart` drain
+(mistaken restart, immediate countermand — a ~30s window) exits the daemon and the
+driver respawns anyway: the countermand is defeated once. Recovery is trivial —
+**the second `!shutdown` sticks: no driver rides a clean restart.** Ruled
+document-as-known-limit v1 (Lens pre-read flag, PM ruling): exit-intent
+discrimination would put a discriminator inside the one path this design keeps
+canonical, and a misfire there is worse than the race.
+
 ## 10. Out of scope
 
 Timer-based or schedule-based restarts; automatic crash respawn; cross-seat restart authority;
