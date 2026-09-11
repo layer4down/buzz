@@ -71,17 +71,24 @@ executor may die mid-turn (the 9/6 self-bounce trap, lib.rs in-flight drain).
   Liveness via `/bin/kill -0` (std has no kill(2); one short-lived process per poll, exit
   code only). `kill -0` succeeds on zombies — production parents reap (launchd / the script
   daemonizer), so this is a test-harness concern only, noted in the tests.
-- **Driver behavior**: poll `kill(pid, 0)` for parent exit (bounded: drain budget 30s + 90s
+- **Driver behavior**: poll `/bin/kill -0` for parent exit (bounded: drain budget 30s + 90s
   slack, then give up and log-exit — never park forever); on parent exit, respawn per mode:
   `launchd` → `launchctl kickstart gui/<uid>/<label>` (label from env `BUZZ_ACP_LAUNCHD_LABEL`
   where present); `script` → exec the seat's `start.sh` absolute path from env
-  `BUZZ_ACP_START_SCRIPT` (atlas seat only today). Verify respawn (process exists after 10s),
-  then exit 0. Single-instance: `restart-driver.pid` lock beside the seat log; second spawn
-  finds the lock alive and exits silently (bounce.pid lesson).
+  `BUZZ_ACP_START_SCRIPT` (atlas seat only today). VERIFY (N1, as implemented): poll for the
+  respawned pid across the full 10s budget — launchd mode reads the `pid = N` line of
+  `launchctl print`, script mode reads `acp.pid`; success requires the pid ALIVE and (script
+  mode) not the dead parent, so a stale pidfile can't read as the respawn. A respawn slower
+  than the budget misreports failure and drops the receipt while the seat still comes up —
+  the census line is the only loss. Then exit 0. Single-instance: `restart-driver.pid` lock
+  beside the seat log; second spawn finds the lock alive and exits silently (bounce.pid
+  lesson).
 - **Failure mode**: driver dies or gives up ⇒ seat stays down exactly as a TERM without restart
   would — tier 1/2 recover it. No worse than today; no retry loops (§1's ruling).
-- **Boot-integration check** (new, cheap): at startup, if `restart-driver.pid` names a live
-  driver, the daemon logs one INFO line "restarted by driver" — the receipt the census reads.
+- **Boot-integration receipt** (new, cheap, N3-corrected): the driver writes
+  `restart-driver.receipt` (ts, old pid, new pid) on verified respawn; at startup the daemon
+  reads it, logs one INFO line "restarted by driver", and consumes the file — the receipt the
+  census reads. It is a FILE consumed at boot, not pid-liveness of a live driver.
 
 ## 5. Config
 

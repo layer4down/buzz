@@ -2395,37 +2395,37 @@ async fn tokio_main() -> Result<()> {
                             // driver arm — the clean exit proceeds regardless; a
                             // failed respawn leaves the seat down, which is tier-1/3
                             // (host-side) territory, never worse than !shutdown.
-                            let is_restart = is_owner_control_command(
+                            // The R1 owner-only gate lives in the pure decision
+                            // fn (restart.rs::restart_decision) so the four table
+                            // arms cover it: shape-match AND owner_cache ==
+                            // Some(author). Missing owner_cache = fail-closed
+                            // (falls through to prompt handling), matching
+                            // !shutdown. Non-owner `!restart` also falls through
+                            // — a regular message, family precedent.
+                            if restart::restart_decision(
                                 &buzz_event.event,
                                 kind_u32,
-                                "!restart",
                                 &pubkey_hex,
-                            );
-                            if is_restart {
-                                if let Some(owner) = owner_cache.get() {
-                                    if buzz_event.event.pubkey.to_hex() == *owner {
-                                        match restart::spawn_restart_driver(std::process::id()) {
-                                            Ok(true) => tracing::info!(
-                                                channel_id = %buzz_event.channel_id,
-                                                sender = %buzz_event.event.pubkey.to_hex(),
-                                                "!restart from owner — detached driver armed, initiating clean exit"
-                                            ),
-                                            Ok(false) => tracing::warn!(
-                                                channel_id = %buzz_event.channel_id,
-                                                "!restart from owner — no respawn target configured (BUZZ_ACP_LAUNCHD_LABEL / BUZZ_ACP_START_SCRIPT unset); proceeding with clean exit, seat will stay down"
-                                            ),
-                                            Err(e) => tracing::warn!(
-                                                channel_id = %buzz_event.channel_id,
-                                                error = %e,
-                                                "!restart from owner — driver spawn failed; proceeding with clean exit, seat will stay down"
-                                            ),
-                                        }
-                                        let _ = shutdown_tx.send(());
-                                        continue;
-                                    }
+                                owner_cache.get(),
+                            ) {
+                                match restart::spawn_restart_driver(std::process::id()) {
+                                    Ok(true) => tracing::info!(
+                                        channel_id = %buzz_event.channel_id,
+                                        sender = %buzz_event.event.pubkey.to_hex(),
+                                        "!restart from owner — detached driver armed, initiating clean exit"
+                                    ),
+                                    Ok(false) => tracing::warn!(
+                                        channel_id = %buzz_event.channel_id,
+                                        "!restart from owner — no respawn target configured (BUZZ_ACP_LAUNCHD_LABEL / BUZZ_ACP_START_SCRIPT unset); proceeding with clean exit, seat will stay down"
+                                    ),
+                                    Err(e) => tracing::warn!(
+                                        channel_id = %buzz_event.channel_id,
+                                        error = %e,
+                                        "!restart from owner — driver spawn failed; proceeding with clean exit, seat will stay down"
+                                    ),
                                 }
-                                // Not from owner — fall through to normal prompt
-                                // handling, same as the rest of the family.
+                                let _ = shutdown_tx.send(());
+                                continue;
                             }
 
                             // Mirrors !shutdown: kind:9, content "!cancel", from
@@ -3152,7 +3152,7 @@ enum LoopAction {
     Exit,
 }
 
-fn event_mentions_agent(event: &nostr::Event, agent_pubkey_hex: &str) -> bool {
+pub(crate) fn event_mentions_agent(event: &nostr::Event, agent_pubkey_hex: &str) -> bool {
     event.tags.iter().any(|t| {
         t.as_slice().first().map(|s| s.as_str()) == Some("p")
             && t.as_slice().get(1).map(|s| s.as_str()) == Some(agent_pubkey_hex)
