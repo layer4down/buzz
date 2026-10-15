@@ -4,17 +4,24 @@ import UIKit
 import UserNotifications
 
 @main
-@objc class AppDelegate: FlutterAppDelegate, FlutterImplicitEngineDelegate {
+@objc class AppDelegate: FlutterAppDelegate, FlutterImplicitEngineDelegate, UNUserNotificationCenterDelegate, FlutterStreamHandler {
   private var mediaUploadChannel: FlutterMethodChannel?
   private var qrScannerChannel: FlutterMethodChannel?
   private var inlinePhotoPickerSupportChannel: FlutterMethodChannel?
   private var concentricSheetSurfaceChannel: FlutterMethodChannel?
+  private var apnsChannel: FlutterMethodChannel?
+  private var apnsEventChannel: FlutterEventChannel?
+  private var apnsEventSink: FlutterEventSink?
   private var nativeAttachmentPopoverCoordinator: NativeAttachmentPopoverCoordinator?
 
   override func application(
     _ application: UIApplication,
     didFinishLaunchingWithOptions launchOptions: [UIApplication.LaunchOptionsKey: Any]?
   ) -> Bool {
+    // Keep the badge-only request for existing behavior; full push
+    // authorization (alert + sound + badge) is requested on-demand when
+    // the push provider calls the `register` method channel.
+    UNUserNotificationCenter.current().delegate = self
     UNUserNotificationCenter.current().requestAuthorization(options: [.badge]) { _, _ in }
     return super.application(application, didFinishLaunchingWithOptions: launchOptions)
   }
@@ -95,6 +102,118 @@ import UserNotifications
       messenger: messenger,
       parentViewController: nativeAttachmentRegistrar?.viewController
     )
+
+    // APNs push notification channel.
+    apnsChannel = FlutterMethodChannel(
+      name: "com.block.buzz/apns",
+      binaryMessenger: messenger
+    )
+    apnsChannel?.setMethodCallHandler { [weak self] call, result in
+      self?.handleApnsMethodCall(call, result: result)
+    }
+
+    apnsEventChannel = FlutterEventChannel(
+      name: "com.block.buzz/apns/events",
+      binaryMessenger: messenger
+    )
+    apnsEventChannel?.setStreamHandler(self)
+  }
+
+  // MARK: - APNs
+
+  private func handleApnsMethodCall(
+    _ call: FlutterMethodCall,
+    result: @escaping FlutterResult
+  ) {
+    switch call.method {
+    case "register":
+      UNUserNotificationCenter.current().requestAuthorization(
+        options: [.alert, .badge, .sound]
+      ) { granted, error in
+        guard granted, error == nil else {
+          DispatchQueue.main.async { result(nil) }
+          return
+        }
+        DispatchQueue.main.async {
+          UIApplication.shared.registerForRemoteNotifications()
+          // The token arrives via didRegisterForRemoteNotifications callback.
+          // If registration was already completed, the callback fires again
+          // immediately with the same token.
+        }
+      }
+      // The result is returned from the didRegister callback, not here.
+      // But Flutter expects a synchronous or eventual result. We return nil
+      // here and let the token arrive through the event channel. For the
+      // initial call, we need to hold the result until the token arrives.
+      // Simpler: return a placeholder; the real token comes via events.
+      // Actually, we need to return the token from the method call itself.
+      // Let's store the result callback and invoke it when the token arrives.
+      pendingApnsResult = result
+
+    case "hasPermission":
+      UNUserNotificationCenter.current().getNotificationSettings { settings in
+        let granted = settings.authorizationStatus == .authorized
+          || settings.authorizationStatus == .provisional
+        DispatchQueue.main.async { result(granted) }
+      }
+
+    default:
+      result(FlutterMethodNotImplemented)
+    }
+  }
+
+  private var pendingApnsResult: FlutterResult?
+
+  override func application(
+    _ application: UIApplication,
+    didRegisterForRemoteNotificationsWithDeviceToken deviceToken: Data
+  ) {
+    let token = deviceToken.map { String(format: "%02x", $0) }.joined()
+    debugPrint("APNs: device token registered (\(token.prefix(16))…)")
+
+    // Resolve the pending `register` method call.
+    if let pending = pendingApnsResult {
+      pending(token)
+      pendingApnsResult = nil
+    }
+
+    // Push to the event stream for token refresh notifications.
+    apnsEventSink?(token)
+  }
+
+  override func application(
+    _ application: UIApplication,
+    didFailToRegisterForRemoteNotificationsWithError error: Error
+  ) {
+    debugPrint("APNs: registration failed — \(error.localizedDescription)")
+    if let pending = pendingApnsResult {
+      pending(nil)
+      pendingApnsResult = nil
+    }
+  }
+
+  // MARK: - UNUserNotificationCenterDelegate
+
+  func userNotificationCenter(
+    _ center: UNUserNotificationCenter,
+    willPresent notification: UNNotification,
+    withCompletionHandler completionHandler:
+      @escaping (UNNotificationPresentationOptions) -> Void
+  ) {
+    // Show banner + sound + badge when a push arrives in the foreground.
+    completionHandler([.banner, .badge, .sound])
+  }
+
+  // MARK: - FlutterStreamHandler
+
+  func onListen(withArguments arguments: Any?, eventSink events: @escaping FlutterEventSink) -> FlutterError? {
+    apnsEventSink = events
+    return nil
+  }
+
+  func onCancel(withArguments arguments: Any?) -> FlutterError? {
+    apnsEventSink = nil
+    return nil
   }
 
   private static func handleQrScannerMethodCall(

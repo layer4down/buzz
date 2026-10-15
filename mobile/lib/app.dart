@@ -13,6 +13,7 @@ import 'features/pairing/pairing_page.dart';
 import 'features/channels/agent_activity/observer_subscription.dart';
 import 'features/channels/deep_link_dispatcher.dart';
 import 'features/profile/user_status_cache_provider.dart';
+import 'features/push/push_provider.dart';
 import 'features/profile/settings_profile_header.dart';
 import 'features/settings/settings_page.dart';
 import 'shared/auth/auth.dart';
@@ -87,6 +88,15 @@ class App extends HookConsumerWidget {
       ref.watch(appLifecycleProvider);
       ref.watch(userStatusCacheProvider);
       hasUnreadInbox = ref.watch(_unreadInboxItemCountProvider) > 0;
+
+      // Activate push notifications once auth is confirmed. The provider
+      // is idempotent — safe to call on every rebuild.
+      ref.watch(pushProvider);
+      ref.listen<AuthState>(authProvider, (_, next) {
+        if (next.status == AuthStatus.authenticated) {
+          ref.read(pushProvider.notifier).activate();
+        }
+      });
     }
 
     // Start listening for buzz:// links immediately (even pre-auth) so a
