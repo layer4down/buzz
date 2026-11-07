@@ -7550,16 +7550,17 @@ printf '%s\n' '{{"jsonrpc":"2.0","id":0,"result":{{"stopReason":"end_turn"}}}}'"
         // session invalidation.
         let mut s = SessionState::default();
         let ch = Uuid::new_v4();
-        s.sessions.insert(ch, "s1".into());
-        s.core_sections.insert(ch, "core-a".into());
-        s.baked_core_sections.insert(ch, "core-a".into());
+        let scope = SessionScope::Conversation { channel_id: ch };
+        s.sessions.insert(scope.clone(), "s1".into());
+        s.core_sections.insert(scope.clone(), "core-a".into());
+        s.baked_core_sections.insert(scope.clone(), "core-a".into());
         assert!(s.has_channel_state(&ch));
-        assert!(s.invalidate_channel(&ch));
+        assert_eq!(s.invalidate_channel(&ch), 1);
         assert!(!s.has_channel_state(&ch));
-        assert!(!s.baked_core_sections.contains_key(&ch));
-        assert!(!s.core_sections.contains_key(&ch));
+        assert!(!s.baked_core_sections.contains_key(&scope));
+        assert!(!s.core_sections.contains_key(&scope));
 
-        s.baked_core_sections.insert(ch, "stale-baseline".into());
+        s.baked_core_sections.insert(scope, "stale-baseline".into());
         s.invalidate_all();
         assert!(s.baked_core_sections.is_empty());
     }

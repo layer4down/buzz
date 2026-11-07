@@ -70,9 +70,12 @@ pub enum CoreFetch {
 }
 
 /// Section header used by the A1 core-section rendering (and stripped again
-/// by `section_profile` for hashing). Matches the label upstream's
-/// `prompt_framing::semantic_section("core-memory", ..)` renders.
-const SECTION_LABEL: &str = "core-memory";
+/// by `section_profile` for hashing). Deliberately the fleet-proven legacy
+/// bracket label, NOT upstream's `<core-memory>` semantic framing — the 0.5.23
+/// port preserves fork prompt bytes (header canonicalization is an open drift
+/// axis for the Lens review window; see prompt_framing::normalize_semantic_section
+/// for the upstream migration helper).
+const SECTION_LABEL: &str = "Agent Memory — core";
 
 /// Monotonic per-reason refresh-failure counters (the PR-1 `drops_total`
 /// discipline): a silently-failing refresh is MEM-FREEZE rebuilt via the

@@ -3146,6 +3146,7 @@ mod tests {
         let event = make_event("hi");
         let batch = FlushBatch {
             channel_id: ch,
+            scope: crate::scope::SessionScope::Conversation { channel_id: ch },
             events: vec![BatchEvent {
                 event,
                 prompt_tag: "test".into(),
@@ -3159,6 +3160,12 @@ mod tests {
             &FormatPromptArgs {
                 agent_core_delta: Some("[Agent Memory — core]\nbe v2"),
                 has_system_prompt_support: true,
+                channel_info: Some(&PromptChannelInfo {
+                    name: "delta-test".into(),
+                    channel_type: "stream".into(),
+                    description: None,
+                    project: None,
+                }),
                 ..Default::default()
             },
         )
@@ -3170,10 +3177,10 @@ mod tests {
         let core_pos = prompt
             .find("[Agent Memory")
             .expect("[Agent Memory] missing");
-        let context_pos = prompt.find("[Context]").expect("[Context] missing");
+        let context_pos = prompt.find("<context>").expect("<context> missing");
         assert!(
             core_pos < context_pos,
-            "delta core section must precede [Context]"
+            "delta core section must precede <context>"
         );
     }
 
@@ -3186,6 +3193,7 @@ mod tests {
         let event = make_event("hi");
         let batch = FlushBatch {
             channel_id: ch,
+            scope: crate::scope::SessionScope::Conversation { channel_id: ch },
             events: vec![BatchEvent {
                 event,
                 prompt_tag: "test".into(),
@@ -3198,6 +3206,12 @@ mod tests {
             &batch,
             &FormatPromptArgs {
                 has_system_prompt_support: true,
+                channel_info: Some(&PromptChannelInfo {
+                    name: "delta-test".into(),
+                    channel_type: "stream".into(),
+                    description: None,
+                    project: None,
+                }),
                 ..Default::default()
             },
         )
@@ -3206,7 +3220,7 @@ mod tests {
             !prompt.contains("[Agent Memory"),
             "no delta means no core section in the user message; got: {prompt}"
         );
-        assert!(prompt.starts_with("[Context]"));
+        assert!(prompt.starts_with("<context>"));
     }
 
     #[test]
