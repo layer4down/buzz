@@ -3,7 +3,7 @@
 //!
 //! Scope per Tyler's spec:
 //! - Fire one synchronous query for the core head when a *new* session is born.
-//! - If a body is found, emit `[Agent Memory — core]\n<profile>`.
+//! - If a body is found, emit `<core-memory>…</core-memory>`.
 //! - If no body is found, emit an onboarding nudge so the agent learns how
 //!   to set its own core.
 //! - On any *error* (transport, parse), log and emit nothing. We must not
@@ -18,9 +18,6 @@ use sha2::{Digest, Sha256};
 use std::sync::atomic::{AtomicU64, Ordering};
 
 use crate::relay::RestClient;
-
-/// Section header rendered into the prompt.
-const SECTION_LABEL: &str = "Agent Memory — core";
 
 /// Onboarding nudge for new agents with no core yet.
 ///
@@ -71,6 +68,14 @@ pub enum CoreFetch {
     Absent,
     Failed(String),
 }
+
+/// Section header used by the A1 core-section rendering (and stripped again
+/// by `section_profile` for hashing). Deliberately the fleet-proven legacy
+/// bracket label, NOT upstream's `<core-memory>` semantic framing — the 0.5.23
+/// port preserves fork prompt bytes (header canonicalization is an open drift
+/// axis for the Lens review window; see prompt_framing::normalize_semantic_section
+/// for the upstream migration helper).
+const SECTION_LABEL: &str = "Agent Memory — core";
 
 /// Monotonic per-reason refresh-failure counters (the PR-1 `drops_total`
 /// discipline): a silently-failing refresh is MEM-FREEZE rebuilt via the
